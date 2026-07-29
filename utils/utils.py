@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Define ORION_CONFIGS_PATH locally to avoid circular import
-ORION_CONFIGS_PATH = "/orion/examples/"
+ORION_CONFIGS_PATH = "/Users/balatripurakumaribodapati/Desktop/orion-ai/orion/examples/"
 
 # Context variable for ES config from encrypted request headers
 # Provides async-safe isolation between concurrent requests
@@ -209,15 +209,9 @@ async def run_orion(
 
 
 async def summarize_result(result: subprocess.CompletedProcess, isolate: Optional[str] = None) -> dict | str:
-    """
-    Summarize the Orion result into a dictionary.
+    """Summarize Orion result into per-metric value lists.
 
-    Args:
-        result: The json output from the Orion command.
-        isolate: Optional metric name to isolate for backwards compatibility.
-
-    Returns:
-        A dictionary containing the summary of the Orion analysis with full run data preserved.
+    Returns {metric_name: {"value": [v1, v2, ...]}, ...} or {} on no data.
     """
     summary = {}
     try:
@@ -228,23 +222,12 @@ async def summarize_result(result: subprocess.CompletedProcess, isolate: Optiona
         if len(data) == 0:
             return {}
 
-        # Store all runs with full data
-        summary["runs"] = data
-
-        # For backwards compatibility, also provide metric-focused summary
         for run in data:
             for metric_name, metric_data in run["metrics"].items():
-                summary["timestamp"] = run["timestamp"]
-                # Isolate specific metric if specified
-                if isolate is not None:
-                    if isolate != metric_name:
-                        print(f"Skipping {metric_name} because it doesn't contain {isolate}")
-                        continue
+                if isolate is not None and isolate != metric_name:
+                    continue
                 if metric_name not in summary:
-                    summary[metric_name] = {}
-                    summary[metric_name] = {
-                        "value": [metric_data["value"]],
-                    }
+                    summary[metric_name] = {"value": [metric_data["value"]]}
                 else:
                     summary[metric_name]["value"].append(metric_data["value"])
     except Exception as e:
