@@ -184,7 +184,10 @@ def _build_input_vars(metadata: dict, version: str) -> dict:
         "fips", "ipsec", "encrypted",
     ):
         if field in metadata:
-            iv[field] = metadata[field]
+            val = metadata[field]
+            if isinstance(val, bool):
+                val = str(val).lower()
+            iv[field] = val
     return iv
 
 
@@ -200,7 +203,7 @@ async def _discover_configs_with_vars(
     encrypted: bool = False,
     benchmark_filter=None,
     job_filters: list[str] | None = None,
-    job_size: int = 1,
+    job_size: int = 20,
     es_benchmark: str = "",
 ) -> tuple[list[dict], list[str], list[dict]]:
     """Discover jobs from ES and return (config, input_vars) pairs.
@@ -209,12 +212,15 @@ async def _discover_configs_with_vars(
         (configs_with_vars, filters_used, raw_jobs) where configs_with_vars is
         [{"config": str, "input_vars": dict, "job": str, "benchmark": str}, ...]
     """
+    exclude = []
     if job_filters is None:
-        job_filters = _build_job_filters(
+        job_filters, exclude = _build_job_filters(
             platform=platform, workload=workload, scale=scale,
             fips=fips, ipsec=ipsec, encrypted=encrypted,
         )
     jobs = await _discover_from_es(version, lookback=lookback, job_filters=job_filters, job_size=job_size, es_benchmark=es_benchmark)
+    if exclude:
+        jobs = [j for j in jobs if not any(kw in j["upstreamJob"].lower() for kw in exclude)]
     configs_with_vars: list[dict] = []
     seen: set[tuple] = set()
     for job in jobs:
@@ -246,11 +252,13 @@ def _build_job_filters(
     fips: bool = False,
     ipsec: bool = False,
     encrypted: bool = False,
-) -> list[str]:
-    """Convert structured NLP-friendly params into a list of ES wildcard filters.
+) -> tuple[list[str], list[str]]:
+    """Convert structured NLP-friendly params into ES wildcard filters + exclusion list.
 
-    Each filter becomes an independent wildcard clause in ES bool.must,
-    so they match regardless of position in the job name.
+    Returns (filters, exclude_keywords):
+      - filters: wildcard clauses for ES bool.must
+      - exclude_keywords: substrings to reject from job names post-query
+        (modifiers not explicitly requested are excluded)
     """
     filters = ["periodic-*"]
     has_cp_filter = any([scale, fips, ipsec, encrypted])
@@ -272,7 +280,15 @@ def _build_job_filters(
         filters.append("*ipsec*")
     if encrypted:
         filters.append("*etcdencrypt*")
-    return filters
+
+    exclude = []
+    if not fips:
+        exclude.append("fips")
+    if not ipsec:
+        exclude.append("ipsec")
+    if not encrypted:
+        exclude.append("etcdencrypt")
+    return filters, exclude
 
 
 def _build_search_block(
@@ -333,7 +349,7 @@ async def _discover_from_es(
     lookback: int = 30,
     job_pattern: str = "*payload-control-plane*",
     job_filters: list[str] | None = None,
-    job_size: int = 1,
+    job_size: int = 20,
     es_benchmark: str = "",
 ) -> list[dict]:
     """Query perf_scale_ci ES index to discover jobs, benchmarks, and metadata.
@@ -520,41 +536,61 @@ def get_orion_configs() -> list[str]:
 
 @mcp.tool()
 async def discover_jobs(
-    version: Annotated[str, Field(description="OpenShift version prefix (e.g. '4.19', '5.0')")] = "4.19",
+    version: Annotated[str, Field(description="OpenShift version prefix (e.g. '4.18', '4.19', '4.20', '4.21', '4.22', '5.0')")] = "4.19",
     lookback: Annotated[int, Field(description="Number of days to look back for job runs")] = 30,
     platform: Annotated[str, Field(
-        description="Cloud platform filter (e.g. 'aws', 'gcp', 'azure', 'metal'). Defaults to 'aws' when not specified.",
+        description=(
+            "Cloud platform filter. Values: 'aws' (default when omitted), 'rosa-hcp' (ROSA HCP managed), "
+            "'rosa' (ROSA classic managed), 'gcp', 'azure', 'metal' (bare-metal). "
+            "When platform is specified without workload, returns ALL jobs on that platform. "
+            "When omitted, defaults to AWS payload-control-plane jobs only."
+        ),
     )] = "",
     workload: Annotated[str, Field(
         description=(
-            "Workload type filter (e.g. 'cluster-density', 'node-density-cni', "
-            "'crd-scale', 'netpol', 'cudn-density', 'cudn-churn', 'udn-density', 'olmv1')."
+            "Workload/test-name filter — matched as substring in CI job name. Common values: "
+            "'payload-control-plane' (nightly 6-node payload jobs, the default), "
+            "'control-plane' (all control-plane jobs including payload, 24/120/252 nodes), "
+            "'data-path' (network throughput/latency, 9 nodes), "
+            "'node-density-heavy' (24 nodes), "
+            "'netpol' (network policy, 24 nodes), "
+            "'udn-density-l3' (UDN L3, 24 nodes), "
+            "'udn-bgp' (UDN BGP, 24 nodes), "
+            "'olmv1' (OLM benchmark), "
+            "'loaded-upgrade' (upgrade testing, 24 nodes). "
+            "Note: 'small-scale' typically means 24-node control-plane jobs (use scale='24')."
         ),
     )] = "",
     scale: Annotated[str, Field(
-        description="Cluster scale filter (e.g. '24', '120', '252').",
+        description=(
+            "Cluster node count filter. Values: '3' (upgrade/UDN), '6' (payload), '9' (data-path), "
+            "'24' (standard control-plane / small-scale), '120' (medium-scale), "
+            "'249' (ROSA large-scale), '252' (AWS large-scale). Maps to '*{N}nodes*' in job name."
+        ),
     )] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")] = False,
+    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs (adds '*fips*' to job name filter).")] = False,
+    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs (adds '*ipsec*' to job name filter).")] = False,
+    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs (adds '*etcdencrypt*' to job name filter).")] = False,
     ctx: Context = None,
 ) -> dict:
     """Discover CI jobs, benchmarks, and cluster metadata from Elasticsearch.
 
-    Use structured params (platform, workload, fips, etc.) for NLP-friendly queries.
-    Each param becomes an independent wildcard — order in the job name doesn't matter.
+    Each param becomes an independent wildcard on the CI job name — order doesn't matter.
+    Defaults: periodic AWS payload-control-plane jobs (nightly 6-node).
+    When platform is given without workload, shows all jobs on that platform.
+    Modifiers (fips/ipsec/scale/encrypted) auto-scope to control-plane jobs.
 
-    Defaults when nothing specified: periodic AWS payload-control-plane jobs.
-
-    Returns dict with 'success', 'search' (what was queried), 'job' name, and 'configs' list.
+    Returns dict with 'success', 'search' (filters used), and 'jobs' list with benchmarks and metadata.
     """
     _extract_and_set_es_server(ctx)
 
-    filters_used = _build_job_filters(
+    filters_used, exclude = _build_job_filters(
         platform=platform, workload=workload, scale=scale,
         fips=fips, ipsec=ipsec, encrypted=encrypted,
     )
     jobs = await _discover_from_es(version, lookback, job_filters=filters_used)
+    if exclude:
+        jobs = [j for j in jobs if not any(kw in j["upstreamJob"].lower() for kw in exclude)]
 
     search = _build_search_block(version, filters_used, lookback, jobs)
     if not jobs:
@@ -1355,21 +1391,29 @@ async def has_nightly_regressed(
         if prev_nightly_info.nightly_date >= nightly_info.nightly_date:
             return "Error: previous_nightly must be earlier than nightly_version."
 
+    requested_configs = set()
     if configs.strip():
-        config_list = [c.strip() for c in configs.split(",") if c.strip()]
-        discovered = [{"config": c, "input_vars": None} for c in config_list]
-        filters_used = []
-    else:
-        discovered, filters_used, jobs = await _discover_configs_with_vars(
-            nightly_info.major_version, platform=platform, workload=workload,
-            scale=scale, fips=fips, ipsec=ipsec, encrypted=encrypted,
+        requested_configs = {c.strip() for c in configs.split(",") if c.strip()}
+
+    discovered, filters_used, jobs = await _discover_configs_with_vars(
+        nightly_info.major_version, platform=platform, workload=workload,
+        scale=scale, fips=fips, ipsec=ipsec, encrypted=encrypted,
+    )
+    if not discovered:
+        search_header = (
+            f"[Search: version={nightly_info.major_version}, "
+            f"filters={', '.join(filters_used)}, jobs_found=0]\n\n"
         )
+        return search_header + f"No jobs found matching filters for version {nightly_info.major_version}"
+
+    if requested_configs:
+        available_configs = {d["config"] for d in discovered}
+        discovered = [d for d in discovered if d["config"] in requested_configs]
         if not discovered:
-            search_header = (
-                f"[Search: version={nightly_info.major_version}, "
-                f"filters={', '.join(filters_used)}, jobs_found=0]\n\n"
+            return (
+                f"No ES jobs matched the requested configs: {', '.join(requested_configs)}. "
+                f"Available configs from discovery: {', '.join(available_configs)}"
             )
-            return search_header + f"No jobs found matching filters for version {nightly_info.major_version}"
 
     search_header = ""
     if filters_used:
@@ -1395,14 +1439,19 @@ async def has_nightly_regressed(
         try:
             data = json.loads(result.stdout)
             if not isinstance(data, list):
+                print(f"[nightly] {config}: stdout not a list, skipping")
                 continue
+            print(f"[nightly] {config}: {len(data)} runs, changepoints={sum(1 for d in data if d.get('is_changepoint'))}")
             data = filter_data_by_timestamp(data, nightly_info.nightly_date)
+            print(f"[nightly] {config}: {len(data)} runs after timestamp filter")
             if prev_nightly_info:
                 data = [e for e in data if e.get("timestamp") and _timestamp_after(e["timestamp"], prev_nightly_info.nightly_date)]
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            print(f"[nightly] {config}: parse error: {exc}, stdout[:200]={result.stdout[:200]}")
             continue
 
         details = _extract_regression_details(json.dumps(data))
+        print(f"[nightly] {config}: {len(details)} regressions extracted")
         for det in details:
             lines = [
                 f"⚠️ Regression in {nightly_info.full_version}",
@@ -1435,15 +1484,43 @@ def _timestamp_after(timestamp_val, cutoff_datetime: datetime) -> bool:
 
 @mcp.tool()
 async def get_performance_summary(
-    version: Annotated[str, Field(description="OpenShift version to analyze (e.g. '4.19')")] = "4.19",
+    version: Annotated[str, Field(description="OpenShift version to analyze (e.g. '4.18', '4.19', '4.20', '4.21', '4.22', '5.0')")] = "4.19",
     lookback: Annotated[int, Field(description="Number of days to look back for data")] = 14,
-    platform: Annotated[str, Field(description="Cloud platform filter (e.g. 'aws', 'gcp', 'metal'). Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload type filter (e.g. 'cluster-density', 'netpol').")] = "",
-    scale: Annotated[str, Field(description="Cluster scale filter (e.g. '24', '120', '252').")] = "",
+    platform: Annotated[str, Field(
+        description=(
+            "Cloud platform filter. Values: 'aws' (default when omitted), 'rosa-hcp' (ROSA HCP managed), "
+            "'rosa' (ROSA classic managed), 'gcp', 'azure', 'metal' (bare-metal). "
+            "When platform is specified, returns jobs for that platform (no payload restriction). "
+            "When omitted, defaults to AWS payload-control-plane jobs."
+        ),
+    )] = "",
+    workload: Annotated[str, Field(
+        description=(
+            "Workload/test-name filter. Common values: "
+            "'payload-control-plane' (nightly 6-node, the default), "
+            "'control-plane' (all control-plane jobs at any scale), "
+            "'data-path', 'node-density-heavy', 'netpol', 'udn-density-l3'. "
+            "Note: 'small-scale' = 24-node control-plane (use scale='24')."
+        ),
+    )] = "",
+    scale: Annotated[str, Field(
+        description=(
+            "Cluster node count filter. '3' (upgrade/UDN), '6' (payload), '9' (data-path), "
+            "'24' (small/standard control-plane), '120' (medium-scale), "
+            "'249' (ROSA large-scale), '252' (AWS large-scale)."
+        ),
+    )] = "",
     fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")] = False,
     ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs.")] = False,
     encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")] = False,
-    config_name: Annotated[str | None, Field(description="Specific config file name (e.g. 'cluster-density.yaml'). If given, only this config is analyzed.")] = None,
+    config_name: Annotated[str | None, Field(
+        description=(
+            "Specific config file name to analyze (e.g. 'cluster-density.yaml', "
+            "'small-rosa-hcp-cluster-density.yaml', 'node-density.yaml'). "
+            "If given, only this config is analyzed. The correct config variant is auto-selected "
+            "based on job type when not specified."
+        ),
+    )] = None,
     ctx: Context = None,
 ) -> dict:
     """Get a complete performance summary in one call.
@@ -1451,7 +1528,9 @@ async def get_performance_summary(
     Discovers jobs, runs Orion analysis for each config, and computes
     per-metric statistics (min, max, avg, change%).
 
-    Defaults when nothing specified: periodic AWS payload-control-plane jobs.
+    Defaults: periodic AWS payload-control-plane jobs (nightly 6-node).
+    When platform is given, analyzes all jobs on that platform.
+    Modifiers (fips/ipsec/scale/encrypted) auto-scope to control-plane jobs.
     """
     _extract_and_set_es_server(ctx)
 
@@ -1504,6 +1583,21 @@ async def get_performance_summary(
         if not isinstance(sum_result, dict):
             continue
 
+        # Second Orion call with 2× lookback for prior-period comparison
+        prior_sum = {}
+        try:
+            prior_result = await run_orion(
+                config=full_path,
+                version=version,
+                lookback=str(lookback * 2),
+                input_vars=iv,
+            )
+            prior_sum_raw = await summarize_result(prior_result)
+            if isinstance(prior_sum_raw, dict):
+                prior_sum = prior_sum_raw
+        except Exception:
+            pass
+
         metric_summaries = []
         for m_name in metrics_list:
             if m_name not in sum_result:
@@ -1516,15 +1610,17 @@ async def get_performance_summary(
             avg_val = sum(values) / len(values)
             meta = meta_map.get(m_name, {})
 
-            mid = len(values) // 2
-            recent_half = values[:mid] if mid > 0 else values
-            older_half = values[mid:] if mid > 0 else []
             change_pct = None
-            if older_half:
-                older_avg = sum(older_half) / len(older_half)
-                recent_avg = sum(recent_half) / len(recent_half)
-                if older_avg != 0:
-                    change_pct = round(((recent_avg - older_avg) / abs(older_avg)) * 100, 2)
+            two_period_values = prior_sum.get(m_name, {}).get("value", [])
+            two_period_values = [v for v in two_period_values if v is not None]
+            current_count = len(values)
+            if len(two_period_values) > current_count:
+                previous_values = two_period_values[:-current_count]
+                if previous_values:
+                    previous_avg = sum(previous_values) / len(previous_values)
+                    current_avg = sum(values) / len(values)
+                    if previous_avg != 0:
+                        change_pct = round(((current_avg - previous_avg) / abs(previous_avg)) * 100, 2)
 
             metric_summaries.append({
                 "name": m_name,
@@ -1661,6 +1757,6 @@ if __name__ == "__main__":
         print("ES_SERVER environment variable is not set")
         import sys
         sys.exit(1)
-    TRANSPORT = "streamable-http"
+    TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
     asyncio.run(mcp.run(transport=TRANSPORT))
 
