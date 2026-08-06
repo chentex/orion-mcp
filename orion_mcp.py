@@ -54,18 +54,7 @@ mcp = FastMCP(name="orion-mcp",
               log_level='INFO')
 
 ORION_CONFIGS_PATH = "/Users/balatripurakumaribodapati/Desktop/orion-ai/orion/examples/"
-_configs=list_orion_configs()
-if _configs == []:
-    ORION_CONFIGS = [
-    "metal-perfscale-cpt-virt-udn-density.yaml",
-    "trt-external-payload-cluster-density.yaml",
-    "trt-external-payload-node-density.yaml",
-    "trt-external-payload-node-density-cni.yaml",
-    "trt-external-payload-crd-scale.yaml",
-    "small-scale-udn-l3.yaml",
-    "med-scale-udn-l3.yaml",]
-else:
-    ORION_CONFIGS = _configs
+ORION_CONFIGS = list_orion_configs()
 
 FULL_ORION_CONFIG_PATHS = [os.path.join(ORION_CONFIGS_PATH, config) for config in ORION_CONFIGS]
 
@@ -117,7 +106,7 @@ for _bm, _entries in _BENCHMARK_CONFIG_MAP.items():
 
 
 _STREAM_PREFIXES = [
-    ("rosa-hcp", "small-rosa-hcp-"),
+    ("rosa-hcp", "rosa-hcp-"),
     ("rosa", "small-rosa-"),
     ("okd", "okd-"),
     ("metal", "metal-"),
@@ -125,9 +114,12 @@ _STREAM_PREFIXES = [
     ("readout", "readout-"),
     ("payload-scale", "payload-scale"),
     ("small-scale", "small-scale-"),
+    ("service-mesh", "servicemesh-"),
+    ("netobserv", "netobserv-"),
+    ("ols", "ols-"),
 ]
 
-_ALL_STREAM_FILE_PREFIXES = tuple(p for _, p in _STREAM_PREFIXES)
+_ALL_STREAM_FILE_PREFIXES = tuple(p for _, p in _STREAM_PREFIXES) + ("small-rosa-hcp-",)
 
 
 def _select_config(benchmark: str, upstream_job: str = "") -> str | None:
@@ -169,6 +161,28 @@ def _parse_input_vars(input_vars: str) -> dict | None:
     return json.loads(input_vars) if input_vars else None
 
 
+DEFAULT_CONFIG = "cluster-density.yaml"
+
+
+async def _resolve_config_and_vars(
+    ctx,
+    config_name: str | None,
+    version: str,
+    input_vars: str = "",
+) -> tuple[str, dict | None, dict]:
+    """Common setup for tools: extract ES config, resolve config name, discover input_vars.
+
+    Returns (config_value, iv, search_info).
+    """
+    _extract_and_set_es_server(ctx)
+    config_value = config_name or DEFAULT_CONFIG
+    iv = _parse_input_vars(input_vars)
+    search_info = {}
+    if iv is None:
+        iv, search_info = await _discover_input_vars_for_config(config_value, version)
+    return config_value, iv, search_info
+
+
 def _build_input_vars(metadata: dict, version: str) -> dict:
     """Build an input_vars dict from ES metadata fields."""
     iv = {
@@ -205,8 +219,14 @@ async def _discover_configs_with_vars(
     job_filters: list[str] | None = None,
     job_size: int = 20,
     es_benchmark: str = "",
+    known_config: str = "",
 ) -> tuple[list[dict], list[str], list[dict]]:
     """Discover jobs from ES and return (config, input_vars) pairs.
+
+    Args:
+        known_config: If set, skip _select_config lookup in ES results and use
+            this config directly. Avoids redundant benchmark→config mapping when
+            the caller already knows the config.
 
     Returns:
         (configs_with_vars, filters_used, raw_jobs) where configs_with_vars is
@@ -218,7 +238,7 @@ async def _discover_configs_with_vars(
             platform=platform, workload=workload, scale=scale,
             fips=fips, ipsec=ipsec, encrypted=encrypted,
         )
-    jobs = await _discover_from_es(version, lookback=lookback, job_filters=job_filters, job_size=job_size, es_benchmark=es_benchmark)
+    jobs = await _discover_from_es(version, lookback=lookback, job_filters=job_filters, job_size=job_size, es_benchmark=es_benchmark, known_config=known_config)
     if exclude:
         jobs = [j for j in jobs if not any(kw in j["upstreamJob"].lower() for kw in exclude)]
     configs_with_vars: list[dict] = []
@@ -321,17 +341,17 @@ async def _discover_input_vars_for_config(
     config_file: str,
     version: str,
 ) -> tuple[dict | None, dict]:
-    """Discover input_vars for a single config via standard job discovery.
+    """Discover input_vars for a single config via ES job discovery.
 
-    Uses the normal discovery path with ES-level benchmark filtering
-    to find which job ran this config's benchmark and extract its metadata.
+    Passes known_config to skip the redundant _select_config lookup
+    (we already know the config, no need to map benchmark→config again).
     """
     benchmark = _CONFIG_TO_BENCHMARK.get(config_file, "")
     if not benchmark:
         return None, {"message": f"No benchmark mapping found for config '{config_file}'"}
 
     discovered, filters_used, jobs = await _discover_configs_with_vars(
-        version, es_benchmark=benchmark,
+        version, es_benchmark=benchmark, known_config=config_file,
     )
     for entry in discovered:
         if entry["config"] == config_file:
@@ -351,6 +371,7 @@ async def _discover_from_es(
     job_filters: list[str] | None = None,
     job_size: int = 20,
     es_benchmark: str = "",
+    known_config: str = "",
 ) -> list[dict]:
     """Query perf_scale_ci ES index to discover jobs, benchmarks, and metadata.
 
@@ -438,8 +459,8 @@ async def _discover_from_es(
 
         for bm_bucket in job_bucket.get("benchmarks", {}).get("buckets", []):
             bm_name = bm_bucket["key"]
-            config_file = _select_config(bm_name, upstream_job)
-            benchmarks.append({"name": bm_name, "config": config_file})
+            cfg = known_config if known_config else _select_config(bm_name, upstream_job)
+            benchmarks.append({"name": bm_name, "config": cfg})
 
             if not metadata:
                 hits = bm_bucket.get("latest", {}).get("hits", {}).get("hits", [])
@@ -609,7 +630,7 @@ async def get_orion_metrics(
     config_name: Annotated[
         str | None,
         Field(
-            description="Orion configuration file name (e.g. 'small-scale-udn-l3.yaml')"
+            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
         ),
     ] = None,
     version: Annotated[str, Field(description="OpenShift version used to query metrics")] = "4.20",
@@ -628,17 +649,9 @@ async def get_orion_metrics(
         A dictionary where the key is the *config* (full path) and the value is a
         list of metric names available for that configuration.
     """
-    # Extract and set ES_SERVER from request headers if present
-    _extract_and_set_es_server(ctx)
+    effective_config, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
 
-    default_config = "small-scale-udn-l3.yaml"
-    effective_config = config_name or default_config
-
-    iv = _parse_input_vars(input_vars)
-    search_info = {}
-    if iv is None:
-        iv, search_info = await _discover_input_vars_for_config(effective_config, version)
-    result = await orion_metrics([ORION_CONFIGS_PATH + effective_config], version=version)
+    result = await orion_metrics([ORION_CONFIGS_PATH + effective_config], version=version, input_vars=iv)
 
     if isinstance(result, str):
         return {"error": f"Failed to fetch Orion metrics: {result}"}
@@ -653,7 +666,7 @@ async def get_orion_metrics_with_meta(
     config_name: Annotated[
         str | None,
         Field(
-            description="Orion configuration file name (e.g. 'small-scale-udn-l3.yaml')"
+            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
         ),
     ] = None,
     version: Annotated[str, Field(description="OpenShift version used to render the config template")] = "4.19",
@@ -671,15 +684,7 @@ async def get_orion_metrics_with_meta(
     Returns:
         A dictionary with "metrics" (list) and "meta" (per-metric metadata).
     """
-    # Extract and set ES_SERVER from request headers if present
-    _extract_and_set_es_server(ctx)
-
-    default_config = "small-scale-udn-l3.yaml"
-    effective_config = config_name or default_config
-    iv = _parse_input_vars(input_vars)
-    search_info = {}
-    if iv is None:
-        iv, search_info = await _discover_input_vars_for_config(effective_config, version)
+    effective_config, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
     try:
         metrics, meta_map = _load_config_metrics_with_meta(
             os.path.join(ORION_CONFIGS_PATH, effective_config),
@@ -692,7 +697,7 @@ async def get_orion_metrics_with_meta(
         return resp
     except Exception as e:
         result = await orion_metrics(
-            [ORION_CONFIGS_PATH + effective_config], version=version
+            [ORION_CONFIGS_PATH + effective_config], version=version, input_vars=iv,
         )
         if isinstance(result, str):
             return {"error": f"{e} | {result}"}
@@ -711,7 +716,7 @@ async def openshift_report_on(
     metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
     config_name: Annotated[
         str | None,
-        Field(description="Orion configuration file name (e.g. 'small-scale-udn-l3.yaml')"),
+        Field(description="Orion configuration file name (e.g. 'cluster-density.yaml')"),
     ] = None,
     input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
     options: Annotated[str, Field(description="Options in format 'output_format' or 'output_format:display_field'. Examples: 'image', 'json', 'both', 'json:ocpVirtVersion'")] = "image",
@@ -728,7 +733,7 @@ async def openshift_report_on(
         lookback: The number of days to look back for performance data. Defaults to 15 days.
         since: The date to begin looking back for performance data. Defaults to None.
         metric: The metric to analyze. Defaults to podReadyLatency_P99.
-        config_name: The config to analyze. Defaults to small-scale-udn-l3.yaml.
+        config_name: The config to analyze. Defaults to cluster-density.yaml.
         input_vars: JSON string of template variables for config rendering.
         options: Output format and optional display field. Format: 'output_format' or
                 'output_format:display_field'. Examples: 'image', 'json:ocpVirtVersion'.
@@ -736,11 +741,6 @@ async def openshift_report_on(
     Returns:
         Returns an image showing the performance overtime, or JSON data based on options.
     """
-    # Extract and set ES_SERVER from request headers if present
-    _extract_and_set_es_server(ctx)
-
-    iv = _parse_input_vars(input_vars)
-
     # Parse options to extract output_format and display
     if ":" in options:
         output_format, display = options.split(":", 1)
@@ -754,14 +754,10 @@ async def openshift_report_on(
     else:
         version_list = list(versions)
 
+    config_value, iv, _ = await _resolve_config_and_vars(ctx, config_name, version_list[0], input_vars)
+
     series: dict[str, list[float]] = {}
     full_data: dict[str, dict] = {}
-
-    default_config = "small-scale-udn-l3.yaml"
-    config_value = config_name or default_config
-
-    if iv is None:
-        iv, _ = await _discover_input_vars_for_config(config_value, version_list[0])
 
     errors = []
     for ver in version_list:
@@ -841,7 +837,7 @@ async def get_orion_performance_data(
     config_name: Annotated[
         str | None,
         Field(
-            description="Orion configuration file name (e.g. 'small-scale-udn-l3.yaml')"
+            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
         ),
     ] = None,
     *,
@@ -857,16 +853,7 @@ async def get_orion_performance_data(
     Returns:
         Dict with config, metric, version, lookback, values, count.
     """
-    # Extract and set ES_SERVER from request headers if present
-    _extract_and_set_es_server(ctx)
-
-    iv = _parse_input_vars(input_vars)
-    default_config = "small-scale-udn-l3.yaml"
-    config_value = config_name or default_config
-
-    search_info = {}
-    if iv is None:
-        iv, search_info = await _discover_input_vars_for_config(config_value, version)
+    config_value, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
 
     try:
         result = await run_orion(
@@ -1289,7 +1276,7 @@ async def metrics_correlation(
     config_name: Annotated[
         str | None,
         Field(
-            description="Orion configuration file name (e.g. 'trt-external-payload-cluster-density.yaml')"
+            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
         ),
     ] = None,
     since: Annotated[str, Field(description="Date to begin looking back for performance data")] = None,
@@ -1306,17 +1293,8 @@ async def metrics_correlation(
     returned. If either metric is missing from the Orion results the function
     falls back to returning a textual error message.
     """
-    # Extract and set ES_SERVER from request headers if present
-    _extract_and_set_es_server(ctx)
+    config_value, iv, _ = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
 
-    iv = _parse_input_vars(input_vars)
-    default_config = "trt-external-payload-cluster-density.yaml"
-    config_value = config_name or default_config
-
-    if iv is None:
-        iv, _ = await _discover_input_vars_for_config(config_value, version)
-
-    # Run Orion to gather data
     result = await run_orion(
         config=ORION_CONFIGS_PATH + config_value,
         version=version,
@@ -1439,19 +1417,14 @@ async def has_nightly_regressed(
         try:
             data = json.loads(result.stdout)
             if not isinstance(data, list):
-                print(f"[nightly] {config}: stdout not a list, skipping")
                 continue
-            print(f"[nightly] {config}: {len(data)} runs, changepoints={sum(1 for d in data if d.get('is_changepoint'))}")
             data = filter_data_by_timestamp(data, nightly_info.nightly_date)
-            print(f"[nightly] {config}: {len(data)} runs after timestamp filter")
             if prev_nightly_info:
                 data = [e for e in data if e.get("timestamp") and _timestamp_after(e["timestamp"], prev_nightly_info.nightly_date)]
-        except (json.JSONDecodeError, TypeError) as exc:
-            print(f"[nightly] {config}: parse error: {exc}, stdout[:200]={result.stdout[:200]}")
+        except (json.JSONDecodeError, TypeError):
             continue
 
         details = _extract_regression_details(json.dumps(data))
-        print(f"[nightly] {config}: {len(details)} regressions extracted")
         for det in details:
             lines = [
                 f"⚠️ Regression in {nightly_info.full_version}",

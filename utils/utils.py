@@ -306,28 +306,29 @@ def get_es_benchmark_index() -> str:
     return resolve_env_var("es_benchmark_index", "ES_BENCHMARK_INDEX", "ripsaw-kube-burner-*")
 
 
-async def orion_metrics(config_list: list, version: str = "4.20") -> dict | str:
+async def orion_metrics(config_list: list, version: str = "4.20", input_vars: Optional[dict] = None) -> dict | str:
     """
     Provide the metrics for Orion analysis.
     Args:
         config_list: List of Orion configuration files.
+        version: OpenShift version to query.
+        input_vars: Optional template variables for config rendering.
     Returns:
         A dictionary containing the metrics for Orion analysis.
         the key is the config the metric is associated with
         the value is a list of all the metric names that are available for that config
     """
-    metrics = {} 
+    metrics = {}
     for config in config_list:
         result = await run_orion(
             config=config,
             version=version,
-            lookback="15"
+            lookback="15",
+            input_vars=input_vars,
         )
         try:
             sum_result = await summarize_result(result)
-            print(f"Sum result: {sum_result}")
             if isinstance(sum_result, dict):
-                # Exclude helper keys so callers do not mistake metadata fields like runs/timestamp for queryable metrics.
                 metrics[config] = [
                     key for key in sum_result.keys() if key not in {"runs", "timestamp"}
                 ]
@@ -336,7 +337,7 @@ async def orion_metrics(config_list: list, version: str = "4.20") -> dict | str:
         except (KeyError, ValueError, TypeError) as e:
             return f"Error processing result for {config}: {e}"
 
-    return metrics 
+    return metrics
     
 
 # Correlation helper functions
