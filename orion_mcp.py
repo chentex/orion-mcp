@@ -215,32 +215,68 @@ async def _discover_configs_with_vars(
     fips: bool = False,
     ipsec: bool = False,
     encrypted: bool = False,
+    job_type: str = "periodic",
+    organization: str = "",
+    repository: str = "",
     benchmark_filter=None,
-    job_filters: list[str] | None = None,
     job_size: int = 20,
     es_benchmark: str = "",
     known_config: str = "",
-) -> tuple[list[dict], list[str], list[dict]]:
+) -> tuple[list[dict], dict, list[dict]]:
     """Discover jobs from ES and return (config, input_vars) pairs.
 
-    Args:
-        known_config: If set, skip _select_config lookup in ES results and use
-            this config directly. Avoids redundant benchmark→config mapping when
-            the caller already knows the config.
+    Converts user-facing params (platform name, bool flags) into ES indexed
+    field values and delegates to ``_discover_from_es``.
+
+    Defaults when nothing specific is requested: periodic AWS 6-node jobs
+    with fips/ipsec/encrypted=false (equivalent to payload-control-plane).
 
     Returns:
         (configs_with_vars, filters_used, raw_jobs) where configs_with_vars is
         [{"config": str, "input_vars": dict, "job": str, "benchmark": str}, ...]
+        and filters_used is a dict of the active ES field filters.
     """
-    exclude = []
-    if job_filters is None:
-        job_filters, exclude = _build_job_filters(
-            platform=platform, workload=workload, scale=scale,
-            fips=fips, ipsec=ipsec, encrypted=encrypted,
-        )
-    jobs = await _discover_from_es(version, lookback=lookback, job_filters=job_filters, job_size=job_size, es_benchmark=es_benchmark, known_config=known_config)
-    if exclude:
-        jobs = [j for j in jobs if not any(kw in j["upstreamJob"].lower() for kw in exclude)]
+    es_platform, es_cluster_type = _resolve_platform(platform)
+    es_worker_count = int(scale) if scale else 0
+
+    has_modifier = any([workload, scale, fips, ipsec, encrypted, platform, organization])
+    if not has_modifier and not es_benchmark:
+        es_worker_count = 6
+    elif any([fips, ipsec, encrypted]) and not workload:
+        workload = "control-plane"
+
+    es_fips = "true" if fips else "false"
+    es_ipsec = "true" if ipsec else "false"
+    es_encrypted = "true" if encrypted else "false"
+
+    filters_used: dict = {
+        "version": version,
+        "jobType": job_type,
+        "platform": es_platform,
+        "fips": es_fips,
+        "ipsec": es_ipsec,
+        "encrypted": es_encrypted,
+    }
+    if es_cluster_type:
+        filters_used["clusterType"] = es_cluster_type
+    if es_worker_count:
+        filters_used["workerNodesCount"] = es_worker_count
+    if workload:
+        filters_used["workload"] = workload
+    if organization:
+        filters_used["organization"] = organization
+    if repository:
+        filters_used["repository"] = repository
+
+    jobs = await _discover_from_es(
+        version, lookback,
+        job_type=job_type, platform=es_platform, cluster_type=es_cluster_type,
+        worker_count=es_worker_count, fips=es_fips, ipsec=es_ipsec,
+        encrypted=es_encrypted, organization=organization, repository=repository,
+        workload=workload, benchmark=es_benchmark, known_config=known_config,
+        job_size=job_size,
+    )
+
     configs_with_vars: list[dict] = []
     seen: set[tuple] = set()
     for job in jobs:
@@ -262,58 +298,30 @@ async def _discover_configs_with_vars(
                 "job": job["upstreamJob"],
                 "benchmark": bm.get("name", ""),
             })
-    return configs_with_vars, job_filters, jobs
+    return configs_with_vars, filters_used, jobs
 
 
-def _build_job_filters(
-    platform: str = "",
-    workload: str = "",
-    scale: str = "",
-    fips: bool = False,
-    ipsec: bool = False,
-    encrypted: bool = False,
-) -> tuple[list[str], list[str]]:
-    """Convert structured NLP-friendly params into ES wildcard filters + exclusion list.
+_PLATFORM_MAP = {
+    "aws": ("AWS", ""),
+    "gcp": ("GCP", ""),
+    "azure": ("Azure", ""),
+    "metal": ("BareMetal", ""),
+    "baremetal": ("BareMetal", ""),
+    "rosa-hcp": ("AWS", "rosa-hcp"),
+    "rosa": ("AWS", "rosa"),
+}
 
-    Returns (filters, exclude_keywords):
-      - filters: wildcard clauses for ES bool.must
-      - exclude_keywords: substrings to reject from job names post-query
-        (modifiers not explicitly requested are excluded)
-    """
-    filters = ["periodic-*"]
-    has_cp_filter = any([scale, fips, ipsec, encrypted])
-    if workload:
-        filters.append(f"*{workload}*")
-    elif has_cp_filter:
-        filters.append("*control-plane*")
-    elif not platform:
-        filters.append("*payload-control-plane*")
-    if platform:
-        filters.append(f"*{platform.replace('-', '_')}*")
-    else:
-        filters.append("*aws*")
-    if scale:
-        filters.append(f"*{scale}nodes*")
-    if fips:
-        filters.append("*fips*")
-    if ipsec:
-        filters.append("*ipsec*")
-    if encrypted:
-        filters.append("*etcdencrypt*")
 
-    exclude = []
-    if not fips:
-        exclude.append("fips")
-    if not ipsec:
-        exclude.append("ipsec")
-    if not encrypted:
-        exclude.append("etcdencrypt")
-    return filters, exclude
+def _resolve_platform(platform: str) -> tuple[str, str]:
+    """Return (es_platform, es_cluster_type) for a user-facing platform name."""
+    if not platform:
+        return "AWS", ""
+    return _PLATFORM_MAP.get(platform.lower(), (platform.upper(), ""))
 
 
 def _build_search_block(
     version: str,
-    filters: list[str],
+    filters: dict,
     lookback_days: int,
     jobs: list[dict],
     *,
@@ -367,21 +375,40 @@ async def _discover_input_vars_for_config(
 async def _discover_from_es(
     version: str,
     lookback: int = 30,
-    job_pattern: str = "*payload-control-plane*",
-    job_filters: list[str] | None = None,
-    job_size: int = 20,
-    es_benchmark: str = "",
+    *,
+    job_type: str = "",
+    platform: str = "",
+    cluster_type: str = "",
+    worker_count: int = 0,
+    fips: str = "",
+    ipsec: str = "",
+    encrypted: str = "",
+    organization: str = "",
+    repository: str = "",
+    workload: str = "",
+    benchmark: str = "",
     known_config: str = "",
+    job_size: int = 20,
 ) -> list[dict]:
     """Query perf_scale_ci ES index to discover jobs, benchmarks, and metadata.
+
+    Uses indexed field filters (jobType, platform, fips, etc.) instead of
+    wildcard-matching on job names. The only remaining job name wildcard is
+    ``workload``, which has no indexed equivalent.
 
     Args:
         version: OCP version prefix (e.g. "4.19").
         lookback: Days to look back.
-        job_pattern: Single wildcard for upstreamJob (backward compat).
-        job_filters: List of independent wildcards — each becomes a bool.must
-            clause so they match regardless of position in the job name.
-            When provided, takes precedence over job_pattern.
+        job_type: Filter on jobType field ("periodic", "pull", "rehearse").
+        platform: Filter on platform field ("AWS", "GCP", "BareMetal").
+        cluster_type: Filter on clusterType field ("rosa-hcp", "self-managed").
+        worker_count: Filter on workerNodesCount (6, 24, 120, 252). 0 = no filter.
+        fips/ipsec/encrypted: Filter on respective fields ("true"/"false").
+        organization/repository: Filter on org/repo fields (for PR queries).
+        workload: Job name wildcard (e.g. "data-path", "netpol").
+        benchmark: Filter on benchmark.keyword.
+        known_config: Skip _select_config and use this config directly.
+        job_size: Max number of job buckets in aggregation.
 
     Returns a list of dicts, each with:
       - upstreamJob: full prow job name
@@ -396,13 +423,28 @@ async def _discover_from_es(
         {"wildcard": {"ocpVersion": {"value": f"{version}*"}}},
         {"range": {"timestamp": {"gte": f"now-{lookback}d"}}},
     ]
-    if job_filters:
-        for filt in job_filters:
-            must_clauses.append({"wildcard": {"upstreamJob.keyword": {"value": filt}}})
-    else:
-        must_clauses.append({"wildcard": {"upstreamJob.keyword": job_pattern}})
-    if es_benchmark:
-        must_clauses.append({"wildcard": {"benchmark.keyword": {"value": f"*{es_benchmark}*"}}})
+    if job_type:
+        must_clauses.append({"term": {"jobType.keyword": job_type}})
+    if platform:
+        must_clauses.append({"term": {"platform.keyword": platform}})
+    if cluster_type:
+        must_clauses.append({"term": {"clusterType.keyword": cluster_type}})
+    if worker_count > 0:
+        must_clauses.append({"term": {"workerNodesCount": worker_count}})
+    if fips:
+        must_clauses.append({"term": {"fips.keyword": fips}})
+    if ipsec:
+        must_clauses.append({"term": {"ipsec.keyword": ipsec}})
+    if encrypted:
+        must_clauses.append({"term": {"encrypted.keyword": encrypted}})
+    if organization:
+        must_clauses.append({"term": {"organization.keyword": organization}})
+    if repository:
+        must_clauses.append({"term": {"repository.keyword": repository}})
+    if workload:
+        must_clauses.append({"wildcard": {"upstreamJob.keyword": {"value": f"*{workload}*"}}})
+    if benchmark:
+        must_clauses.append({"wildcard": {"benchmark.keyword": {"value": f"*{benchmark}*"}}})
 
     query = {
         "size": 0,
@@ -448,8 +490,8 @@ async def _discover_from_es(
 
     total_hits = data.get("hits", {}).get("total", {}).get("value", 0)
     job_buckets = data.get("aggregations", {}).get("jobs", {}).get("buckets", [])
-    logger.info("ES discovery: %d hits, %d job buckets for version=%s pattern=%s",
-                total_hits, len(job_buckets), version, job_pattern)
+    logger.info("ES discovery: %d hits, %d job buckets for version=%s",
+                total_hits, len(job_buckets), version)
 
     results = []
     for job_bucket in job_buckets:
@@ -561,43 +603,36 @@ async def discover_jobs(
     lookback: Annotated[int, Field(description="Number of days to look back for job runs")] = 30,
     platform: Annotated[str, Field(
         description=(
-            "Cloud platform filter. Values: 'aws' (default when omitted), 'rosa-hcp' (ROSA HCP managed), "
-            "'rosa' (ROSA classic managed), 'gcp', 'azure', 'metal' (bare-metal). "
-            "When platform is specified without workload, returns ALL jobs on that platform. "
-            "When omitted, defaults to AWS payload-control-plane jobs only."
+            "Cloud platform filter (filters on ES 'platform' and 'clusterType' fields). "
+            "Values: 'aws' (default), 'rosa-hcp' (ROSA HCP managed), "
+            "'rosa' (ROSA classic), 'gcp', 'azure', 'metal' (bare-metal). "
+            "When specified without workload, returns ALL jobs on that platform. "
+            "When omitted, defaults to AWS 6-node payload jobs."
         ),
     )] = "",
     workload: Annotated[str, Field(
         description=(
-            "Workload/test-name filter — matched as substring in CI job name. Common values: "
-            "'payload-control-plane' (nightly 6-node payload jobs, the default), "
-            "'control-plane' (all control-plane jobs including payload, 24/120/252 nodes), "
-            "'data-path' (network throughput/latency, 9 nodes), "
-            "'node-density-heavy' (24 nodes), "
-            "'netpol' (network policy, 24 nodes), "
-            "'udn-density-l3' (UDN L3, 24 nodes), "
-            "'udn-bgp' (UDN BGP, 24 nodes), "
-            "'olmv1' (OLM benchmark), "
-            "'loaded-upgrade' (upgrade testing, 24 nodes). "
-            "Note: 'small-scale' typically means 24-node control-plane jobs (use scale='24')."
+            "Workload filter — matched as substring in CI job name (only filter not using an indexed field). "
+            "Common values: 'control-plane', 'data-path', 'node-density-heavy', "
+            "'netpol', 'udn-density-l3', 'udn-bgp', 'olmv1', 'loaded-upgrade'. "
+            "When omitted and no other modifier is set, defaults to 6-node payload jobs."
         ),
     )] = "",
     scale: Annotated[str, Field(
         description=(
-            "Cluster node count filter. Values: '3' (upgrade/UDN), '6' (payload), '9' (data-path), "
-            "'24' (standard control-plane / small-scale), '120' (medium-scale), "
-            "'249' (ROSA large-scale), '252' (AWS large-scale). Maps to '*{N}nodes*' in job name."
+            "Cluster worker node count (filters on ES 'workerNodesCount' field). "
+            "Values: '3', '6' (payload), '9' (data-path), '24', '120', '249', '252'."
         ),
     )] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs (adds '*fips*' to job name filter).")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs (adds '*ipsec*' to job name filter).")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs (adds '*etcdencrypt*' to job name filter).")] = False,
+    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs (filters on ES 'fips' field).")] = False,
+    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs (filters on ES 'ipsec' field).")] = False,
+    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs (filters on ES 'encrypted' field).")] = False,
     ctx: Context = None,
 ) -> dict:
     """Discover CI jobs, benchmarks, and cluster metadata from Elasticsearch.
 
-    Each param becomes an independent wildcard on the CI job name — order doesn't matter.
-    Defaults: periodic AWS payload-control-plane jobs (nightly 6-node).
+    Queries ES using indexed field filters (platform, fips, workerNodesCount, etc.).
+    Defaults: periodic AWS 6-node jobs with fips/ipsec/encrypted=false.
     When platform is given without workload, shows all jobs on that platform.
     Modifiers (fips/ipsec/scale/encrypted) auto-scope to control-plane jobs.
 
@@ -605,13 +640,11 @@ async def discover_jobs(
     """
     _extract_and_set_es_server(ctx)
 
-    filters_used, exclude = _build_job_filters(
+    discovered, filters_used, jobs = await _discover_configs_with_vars(
+        version, lookback,
         platform=platform, workload=workload, scale=scale,
         fips=fips, ipsec=ipsec, encrypted=encrypted,
     )
-    jobs = await _discover_from_es(version, lookback, job_filters=filters_used)
-    if exclude:
-        jobs = [j for j in jobs if not any(kw in j["upstreamJob"].lower() for kw in exclude)]
 
     search = _build_search_block(version, filters_used, lookback, jobs)
     if not jobs:
@@ -946,9 +979,12 @@ async def get_pr_details(
     except ValueError as exc:
         raise ValueError("Pull request numbers must be integers") from exc
 
-    pr_filters = [f"pull-ci-{organization}-{repository}-*"]
     discovered, _, _ = await _discover_configs_with_vars(
-        version, job_filters=pr_filters, job_size=10,
+        version,
+        job_type="pull",
+        organization=organization,
+        repository=repository,
+        job_size=10,
     )
     if not discovered:
         discovered, _, _ = await _discover_configs_with_vars(version)
@@ -1182,10 +1218,8 @@ async def _discover_and_check_regressions(
         benchmark_filter=benchmark_filter,
     )
 
-    search_header = (
-        f"[Search: version={version}, filters={', '.join(filters_used)}, "
-        f"jobs_found={len(jobs)}]\n\n"
-    )
+    filter_str = ", ".join(f"{k}={v}" for k, v in filters_used.items())
+    search_header = f"[Search: {filter_str}, jobs_found={len(jobs)}]\n\n"
 
     if not discovered:
         return search_header + f"No jobs found matching filters for version {version}"
@@ -1208,20 +1242,20 @@ async def has_openshift_regressed(
     version: Annotated[str, Field(description="Version of OpenShift to look into")] = "4.19",
     lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
     configs: Annotated[str, Field(description="Comma-separated list of config files to check (optional, auto-discovered if empty)")] = "",
-    platform: Annotated[str, Field(description="Cloud platform filter (e.g. 'aws', 'gcp', 'metal'). Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload type filter (e.g. 'cluster-density', 'netpol', 'cudn-density').")] = "",
-    scale: Annotated[str, Field(description="Cluster scale filter (e.g. '24', '120', '252').")] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")] = False,
+    platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
+    workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol', 'cudn-density'.")] = "",
+    scale: Annotated[str, Field(description="Worker node count (ES 'workerNodesCount'). Values: '6', '24', '120', '252'.")] = "",
+    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
+    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
+    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     ctx: Context = None,
 ) -> str:
     """Runs performance regression analysis against OpenShift using Orion.
 
-    Discovers CI jobs from Elasticsearch using structured filters, then runs
+    Discovers CI jobs from Elasticsearch using indexed field filters, then runs
     EDivisive changepoint detection on each discovered config.
 
-    Defaults when nothing specified: periodic AWS payload-control-plane jobs.
+    Defaults when nothing specified: periodic AWS 6-node jobs (fips/ipsec/encrypted=false).
 
     Returns string with search context and regression results.
     """
@@ -1238,12 +1272,12 @@ async def has_networking_regressed(
     version: Annotated[str, Field(description="Version of OpenShift to look into")] = "4.19",
     lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
     configs: Annotated[str, Field(description="Comma-separated list of config files to check (optional, auto-discovered if empty)")] = "",
-    platform: Annotated[str, Field(description="Cloud platform filter (e.g. 'aws', 'gcp', 'metal'). Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload type filter (e.g. 'cluster-density', 'netpol').")] = "",
-    scale: Annotated[str, Field(description="Cluster scale filter (e.g. '24', '120', '252').")] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")] = False,
+    platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
+    workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol'.")] = "",
+    scale: Annotated[str, Field(description="Worker node count (ES 'workerNodesCount'). Values: '6', '24', '120', '252'.")] = "",
+    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
+    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
+    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     ctx: Context = None,
 ) -> str:
     """Runs regression analysis on networking-focused benchmarks.
@@ -1331,20 +1365,20 @@ async def has_nightly_regressed(
     previous_nightly: Annotated[str, Field(description="Optional previous nightly to compare against (e.g., '4.22.0-0.nightly-2026-01-01-123456')")] = "",
     lookback: Annotated[str, Field(description="Number of days to lookback")] = "30",
     configs: Annotated[str, Field(description="Comma-separated list of config files (optional, auto-discovered if empty)")] = "",
-    platform: Annotated[str, Field(description="Cloud platform filter (e.g. 'aws', 'gcp', 'metal'). Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload type filter (e.g. 'cluster-density', 'netpol').")] = "",
-    scale: Annotated[str, Field(description="Cluster scale filter (e.g. '24', '120', '252').")] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")] = False,
+    platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
+    workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol'.")] = "",
+    scale: Annotated[str, Field(description="Worker node count (ES 'workerNodesCount'). Values: '6', '24', '120', '252'.")] = "",
+    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
+    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
+    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     ctx: Context = None,
 ) -> str:
     """Detect regressions for a specific OpenShift nightly version.
 
-    Discovers CI jobs from Elasticsearch using structured filters, then runs
+    Discovers CI jobs from Elasticsearch using indexed field filters, then runs
     changepoint detection filtered to the nightly date.
 
-    Defaults when nothing specified: periodic AWS payload-control-plane jobs.
+    Defaults when nothing specified: periodic AWS 6-node jobs (fips/ipsec/encrypted=false).
 
     Returns string with search context and regression details.
     """
@@ -1377,11 +1411,10 @@ async def has_nightly_regressed(
         nightly_info.major_version, platform=platform, workload=workload,
         scale=scale, fips=fips, ipsec=ipsec, encrypted=encrypted,
     )
+    filter_str = ", ".join(f"{k}={v}" for k, v in filters_used.items())
+
     if not discovered:
-        search_header = (
-            f"[Search: version={nightly_info.major_version}, "
-            f"filters={', '.join(filters_used)}, jobs_found=0]\n\n"
-        )
+        search_header = f"[Search: {filter_str}, jobs_found=0]\n\n"
         return search_header + f"No jobs found matching filters for version {nightly_info.major_version}"
 
     if requested_configs:
@@ -1393,12 +1426,7 @@ async def has_nightly_regressed(
                 f"Available configs from discovery: {', '.join(available_configs)}"
             )
 
-    search_header = ""
-    if filters_used:
-        search_header = (
-            f"[Search: version={nightly_info.major_version}, "
-            f"filters={', '.join(filters_used)}, configs_found={len(discovered)}]\n\n"
-        )
+    search_header = f"[Search: {filter_str}, configs_found={len(discovered)}]\n\n"
 
     all_regressions: list[str] = []
 
@@ -1461,31 +1489,28 @@ async def get_performance_summary(
     lookback: Annotated[int, Field(description="Number of days to look back for data")] = 14,
     platform: Annotated[str, Field(
         description=(
-            "Cloud platform filter. Values: 'aws' (default when omitted), 'rosa-hcp' (ROSA HCP managed), "
-            "'rosa' (ROSA classic managed), 'gcp', 'azure', 'metal' (bare-metal). "
-            "When platform is specified, returns jobs for that platform (no payload restriction). "
-            "When omitted, defaults to AWS payload-control-plane jobs."
+            "Cloud platform (ES 'platform'/'clusterType'). Values: 'aws' (default), "
+            "'rosa-hcp', 'rosa', 'gcp', 'azure', 'metal'. "
+            "When specified, returns jobs for that platform (no payload restriction). "
+            "When omitted, defaults to AWS 6-node payload jobs."
         ),
     )] = "",
     workload: Annotated[str, Field(
         description=(
-            "Workload/test-name filter. Common values: "
-            "'payload-control-plane' (nightly 6-node, the default), "
-            "'control-plane' (all control-plane jobs at any scale), "
-            "'data-path', 'node-density-heavy', 'netpol', 'udn-density-l3'. "
-            "Note: 'small-scale' = 24-node control-plane (use scale='24')."
+            "Workload filter — matched as substring in job name. Common values: "
+            "'control-plane', 'data-path', 'node-density-heavy', 'netpol', 'udn-density-l3'. "
+            "When omitted and no modifier set, defaults to 6-node payload jobs."
         ),
     )] = "",
     scale: Annotated[str, Field(
         description=(
-            "Cluster node count filter. '3' (upgrade/UDN), '6' (payload), '9' (data-path), "
-            "'24' (small/standard control-plane), '120' (medium-scale), "
-            "'249' (ROSA large-scale), '252' (AWS large-scale)."
+            "Worker node count (ES 'workerNodesCount'). Values: '3', '6' (payload), '9', "
+            "'24', '120', '249', '252'."
         ),
     )] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")] = False,
+    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
+    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
+    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     config_name: Annotated[str | None, Field(
         description=(
             "Specific config file name to analyze (e.g. 'cluster-density.yaml', "
@@ -1501,7 +1526,7 @@ async def get_performance_summary(
     Discovers jobs, runs Orion analysis for each config, and computes
     per-metric statistics (min, max, avg, change%).
 
-    Defaults: periodic AWS payload-control-plane jobs (nightly 6-node).
+    Defaults: periodic AWS 6-node jobs (fips/ipsec/encrypted=false).
     When platform is given, analyzes all jobs on that platform.
     Modifiers (fips/ipsec/scale/encrypted) auto-scope to control-plane jobs.
     """
