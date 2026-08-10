@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Define ORION_CONFIGS_PATH locally to avoid circular import
-ORION_CONFIGS_PATH = "/Users/balatripurakumaribodapati/Desktop/orion-ai/orion/examples/"
+ORION_CONFIGS_PATH = "/orion/examples/"
 
 # Context variable for ES config from encrypted request headers
 # Provides async-safe isolation between concurrent requests
