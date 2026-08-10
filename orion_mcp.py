@@ -686,7 +686,7 @@ async def discover_jobs(
     """
     _extract_and_set_es_server(ctx)
 
-    discovered, filters_used, jobs = await _discover_configs_with_vars(
+    _, filters_used, jobs = await _discover_configs_with_vars(
         version, lookback,
         platform=platform, workload=workload, scale=scale,
         fips=fips, ipsec=ipsec, encrypted=encrypted,
@@ -821,8 +821,6 @@ async def openshift_report_on(
         Each version has: values (flat list of floats) and runs (list with timestamp, ocpVersion, buildUrl).
         values[i] corresponds to runs[i].
     """
-    _extract_and_set_es_server(ctx)
-
     if isinstance(versions, str):
         version_list = [v.strip() for v in versions.split(',') if v.strip()]
     else:
@@ -1472,7 +1470,7 @@ async def has_nightly_regressed(
     if configs.strip():
         requested_configs = {c.strip() for c in configs.split(",") if c.strip()}
 
-    discovered, filters_used, jobs = await _discover_configs_with_vars(
+    discovered, filters_used, _jobs = await _discover_configs_with_vars(
         nightly_info.major_version, platform=platform, workload=workload,
         scale=scale, fips=fips, ipsec=ipsec, encrypted=encrypted,
     )
@@ -1800,11 +1798,10 @@ def _load_config_metrics_with_meta(config_path: str, version: str = "", input_va
             "agg_type": metric.get("agg", {}).get("agg_type") if isinstance(metric.get("agg"), dict) else None,
         }
 
-    metrics_file = rendered_config.get("metricsFile")
-    if metrics_file:
-        metrics_file_path = os.path.join(os.path.dirname(config_path), metrics_file)
+    def _load_metrics_file(mf_name):
+        mf_path = os.path.join(os.path.dirname(config_path), mf_name)
         try:
-            mf_config = _render_config_yaml(metrics_file_path, version, input_vars=input_vars)
+            mf_config = _render_config_yaml(mf_path, version, input_vars=input_vars)
             mf_metrics = mf_config if isinstance(mf_config, list) else mf_config.get("metrics", [])
             for metric in mf_metrics:
                 if isinstance(metric, dict):
@@ -1812,18 +1809,14 @@ def _load_config_metrics_with_meta(config_path: str, version: str = "", input_va
         except Exception:
             pass
 
+    top_metrics_file = rendered_config.get("metricsFile")
+    if top_metrics_file:
+        _load_metrics_file(top_metrics_file)
+
     for test in rendered_config.get("tests", []):
-        metrics_file = test.get("metricsFile")
-        if metrics_file:
-            metrics_file_path = os.path.join(os.path.dirname(config_path), metrics_file)
-            try:
-                mf_config = _render_config_yaml(metrics_file_path, version, input_vars=input_vars)
-                mf_metrics = mf_config if isinstance(mf_config, list) else mf_config.get("metrics", [])
-                for metric in mf_metrics:
-                    if isinstance(metric, dict):
-                        _process_metric(metric)
-            except Exception:
-                pass
+        test_metrics_file = test.get("metricsFile")
+        if test_metrics_file:
+            _load_metrics_file(test_metrics_file)
 
         for metric in test.get("metrics", []):
             _process_metric(metric)
