@@ -193,7 +193,12 @@ def _select_config(benchmark: str, upstream_job: str = "") -> str | None:
 
 def _parse_input_vars(input_vars: str) -> dict | None:
     """Parse a JSON input_vars string into a dict, or return None if empty."""
-    return json.loads(input_vars) if input_vars else None
+    if not input_vars:
+        return None
+    try:
+        return json.loads(input_vars)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 DEFAULT_CONFIG = "cluster-density.yaml"
@@ -272,7 +277,10 @@ async def _discover_configs_with_vars(
         and filters_used is a dict of the active ES field filters.
     """
     es_platform, es_cluster_type = _resolve_platform(platform)
-    es_worker_count = int(scale) if scale else 0
+    try:
+        es_worker_count = int(scale) if scale else 0
+    except ValueError:
+        es_worker_count = 0
 
     has_modifier = any([workload, scale, fips, ipsec, encrypted, platform, organization])
     if not has_modifier and not es_benchmarks:
@@ -516,7 +524,8 @@ async def _discover_from_es(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+        ssl_verify = os.environ.get("ES_SSL_VERIFY", "false").lower() == "true"
+        async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
             resp = await client.post(f"{es_url}/{index}/_search", json=query)
             resp.raise_for_status()
             data = resp.json()
@@ -826,6 +835,9 @@ async def openshift_report_on(
     else:
         version_list = list(versions)
 
+    if not version_list:
+        return {"error": "No valid versions provided"}
+
     config_value, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version_list[0], input_vars)
 
     output: dict = {
@@ -858,18 +870,24 @@ async def openshift_report_on(
             errors.append(f"Unexpected data format for version {ver}")
             continue
 
-        values = [v for v in raw_values if v is not None]
+        raw_runs = sum_result.get("runs", [])
+        values = []
+        runs_context = []
+        for i, v in enumerate(raw_values):
+            if v is None:
+                continue
+            values.append(v)
+            if i < len(raw_runs):
+                run = raw_runs[i]
+                runs_context.append({
+                    "timestamp": run.get("timestamp"),
+                    "ocpVersion": run.get("ocpVersion"),
+                    "buildUrl": run.get("buildUrl"),
+                })
+
         if not values:
             errors.append(f"All values are None for version {ver}")
             continue
-
-        runs_context = []
-        for run in sum_result.get("runs", []):
-            runs_context.append({
-                "timestamp": run.get("timestamp"),
-                "ocpVersion": run.get("ocpVersion"),
-                "buildUrl": run.get("buildUrl"),
-            })
 
         output["versions"][ver] = {"values": values, "runs": runs_context}
 
@@ -1113,6 +1131,8 @@ async def openshift_report_on_pr(
 def _extract_regression_details(stdout: str) -> list[dict]:
     """Extract changepoint details from Orion JSON output."""
     data = json.loads(stdout)
+    if not isinstance(data, list):
+        return []
     details: list[dict] = []
     for idx, dat in enumerate(data):
         if not dat.get("is_changepoint"):
@@ -1627,7 +1647,7 @@ async def get_performance_summary(
         configs_to_run = [c for c in configs_to_run if c["config"] == config_name]
 
     if not configs_to_run:
-        search = _build_search_block(version, filters_used, 30, [],
+        search = _build_search_block(version, filters_used, lookback, [],
             message=f"No jobs found for config '{config_name}'" if config_name else "No jobs found matching filters")
         return {"success": False, "search": search, "configs": []}
 
@@ -1749,7 +1769,9 @@ def _render_config_yaml(config_path: str, version: str = "", input_vars: dict | 
         "organization": "",
         "repository": "",
     }
-    env_vars.update(defaults)
+    for k, v in defaults.items():
+        if v or k not in env_vars:
+            env_vars[k] = v
 
     if input_vars:
         iv = input_vars
