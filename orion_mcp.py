@@ -143,7 +143,7 @@ _JOB_NAME_TO_CONFIG = {
     "cudn-churn-250": "small-scale-cudn-churn-250.yaml",
     "cudn-pod-churn-250": "small-scale-cudn-pod-churn-250.yaml",
     "cudn-incremental-700": "small-scale-cudn-incremental-700.yaml",
-    "cudn-incremental-1000": "small-scale-cudn-incremental-700.yaml",
+    "cudn-incremental-1000": "small-scale-cudn-incremental-1000.yaml",
 }
 
 
