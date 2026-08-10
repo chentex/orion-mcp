@@ -222,6 +222,8 @@ async def summarize_result(result: subprocess.CompletedProcess, isolate: Optiona
         if len(data) == 0:
             return {}
 
+        summary["runs"] = data
+
         for run in data:
             for metric_name, metric_data in run["metrics"].items():
                 if isolate is not None and isolate != metric_name:

@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 from datetime import datetime
 from typing import Annotated
 from pydantic import Field
@@ -29,7 +28,6 @@ from utils.utils import (
     orion_metrics,
     orion_configs,
     generate_correlation_plot,
-    generate_multi_line_plot,
     list_orion_configs,
     parse_nightly_version,
     parse_timestamp,
@@ -61,6 +59,21 @@ FULL_ORION_CONFIG_PATHS = [os.path.join(ORION_CONFIGS_PATH, config) for config i
 logger = logging.getLogger(__name__)
 
 
+class _SafePlaceholder(jinja2.Undefined):
+    """Returns safe placeholder values so config YAML can be parsed without real variables."""
+    def __str__(self):
+        return "PLACEHOLDER"
+    def __iter__(self):
+        return iter([])
+    def __bool__(self):
+        return False
+    def __int__(self):
+        return 0
+
+
+_JINJA_ENV = jinja2.Environment(undefined=_SafePlaceholder)
+
+
 def _build_benchmark_config_map() -> dict[str, list[dict]]:
     """Scan all config YAMLs and build a map from benchmark.keyword to config files."""
     config_map: dict[str, list[dict]] = {}
@@ -79,8 +92,8 @@ def _build_benchmark_config_map() -> dict[str, list[dict]]:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 raw = f.read()
-            safe_content = re.sub(r'"?\{\{[^}]*\}\}[^"]*"?', "PLACEHOLDER", raw)
-            parsed = yaml.safe_load(safe_content)
+            rendered = _JINJA_ENV.from_string(raw).render()
+            parsed = yaml.safe_load(rendered)
             if not isinstance(parsed, dict):
                 continue
             for test in parsed.get("tests", []):
@@ -99,14 +112,16 @@ def _build_benchmark_config_map() -> dict[str, list[dict]]:
 
 _BENCHMARK_CONFIG_MAP = _build_benchmark_config_map()
 
-_CONFIG_TO_BENCHMARK: dict[str, str] = {}
+_CONFIG_TO_BENCHMARKS: dict[str, list[str]] = {}
 for _bm, _entries in _BENCHMARK_CONFIG_MAP.items():
     for _entry in _entries:
-        _CONFIG_TO_BENCHMARK[_entry["file"]] = _bm
+        _CONFIG_TO_BENCHMARKS.setdefault(_entry["file"], [])
+        if _bm not in _CONFIG_TO_BENCHMARKS[_entry["file"]]:
+            _CONFIG_TO_BENCHMARKS[_entry["file"]].append(_bm)
 
 
 _STREAM_PREFIXES = [
-    ("rosa-hcp", "rosa-hcp-"),
+    ("rosa-hcp", "small-rosa-hcp-"),
     ("rosa", "small-rosa-"),
     ("okd", "okd-"),
     ("metal", "metal-"),
@@ -119,13 +134,25 @@ _STREAM_PREFIXES = [
     ("ols", "ols-"),
 ]
 
-_ALL_STREAM_FILE_PREFIXES = tuple(p for _, p in _STREAM_PREFIXES) + ("small-rosa-hcp-",)
+_ALL_STREAM_FILE_PREFIXES = tuple(p for _, p in _STREAM_PREFIXES)
+
+_JOB_NAME_TO_CONFIG = {
+    "cudn-density-single-ns-250": "small-scale-cudn-density-single-ns-250.yaml",
+    "cudn-density-single-ns-500": "small-scale-cudn-density-single-ns-500.yaml",
+    "cudn-density-multi-ns": "small-scale-cudn-density-l2-multi-ns.yaml",
+    "cudn-churn-250": "small-scale-cudn-churn-250.yaml",
+    "cudn-pod-churn-250": "small-scale-cudn-pod-churn-250.yaml",
+    "cudn-incremental-700": "small-scale-cudn-incremental-700.yaml",
+    "cudn-incremental-1000": "small-scale-cudn-incremental-700.yaml",
+}
 
 
 def _select_config(benchmark: str, upstream_job: str = "") -> str | None:
     """Pick the best config file for a given benchmark keyword.
 
     Strategy:
+    0. Explicit job-name-to-config match (for cases like CUDN where
+       the job name has no stream tag but maps to a specific config)
     1. Direct test_name match in upstream_job (exact substring)
     2. Stream-tag match: find a stream keyword in the job name, pick
        the config whose filename starts with that stream's prefix
@@ -138,11 +165,19 @@ def _select_config(benchmark: str, upstream_job: str = "") -> str | None:
         return candidates[0]["file"]
 
     if upstream_job:
+        job_lower = upstream_job.lower().replace("_", "-")
+
+        for job_substr, config_file in _JOB_NAME_TO_CONFIG.items():
+            if job_substr in job_lower:
+                for c in candidates:
+                    if c["file"] == config_file:
+                        return c["file"]
+                break
+
         for c in candidates:
             if c["test_name"] and c["test_name"] in upstream_job:
                 return c["file"]
 
-        job_lower = upstream_job.lower().replace("_", "-")
         for stream_tag, file_prefix in _STREAM_PREFIXES:
             if stream_tag in job_lower:
                 for c in candidates:
@@ -220,7 +255,7 @@ async def _discover_configs_with_vars(
     repository: str = "",
     benchmark_filter=None,
     job_size: int = 20,
-    es_benchmark: str = "",
+    es_benchmarks: list[str] | None = None,
     known_config: str = "",
 ) -> tuple[list[dict], dict, list[dict]]:
     """Discover jobs from ES and return (config, input_vars) pairs.
@@ -240,7 +275,8 @@ async def _discover_configs_with_vars(
     es_worker_count = int(scale) if scale else 0
 
     has_modifier = any([workload, scale, fips, ipsec, encrypted, platform, organization])
-    if not has_modifier and not es_benchmark:
+    if not has_modifier and not es_benchmarks:
+        workload = "payload"
         es_worker_count = 6
     elif any([fips, ipsec, encrypted]) and not workload:
         workload = "control-plane"
@@ -273,7 +309,7 @@ async def _discover_configs_with_vars(
         job_type=job_type, platform=es_platform, cluster_type=es_cluster_type,
         worker_count=es_worker_count, fips=es_fips, ipsec=es_ipsec,
         encrypted=es_encrypted, organization=organization, repository=repository,
-        workload=workload, benchmark=es_benchmark, known_config=known_config,
+        workload=workload, benchmarks=es_benchmarks, known_config=known_config,
         job_size=job_size,
     )
 
@@ -354,12 +390,12 @@ async def _discover_input_vars_for_config(
     Passes known_config to skip the redundant _select_config lookup
     (we already know the config, no need to map benchmark→config again).
     """
-    benchmark = _CONFIG_TO_BENCHMARK.get(config_file, "")
-    if not benchmark:
+    benchmarks = _CONFIG_TO_BENCHMARKS.get(config_file, [])
+    if not benchmarks:
         return None, {"message": f"No benchmark mapping found for config '{config_file}'"}
 
     discovered, filters_used, jobs = await _discover_configs_with_vars(
-        version, es_benchmark=benchmark, known_config=config_file,
+        version, es_benchmarks=benchmarks, known_config=config_file,
     )
     for entry in discovered:
         if entry["config"] == config_file:
@@ -367,7 +403,7 @@ async def _discover_input_vars_for_config(
 
     return None, _build_search_block(
         version, filters_used, 30, jobs,
-        config=config_file, benchmark=benchmark,
+        config=config_file, benchmark=", ".join(benchmarks),
         message=f"No jobs found for config '{config_file}'",
     )
 
@@ -386,7 +422,7 @@ async def _discover_from_es(
     organization: str = "",
     repository: str = "",
     workload: str = "",
-    benchmark: str = "",
+    benchmarks: list[str] | None = None,
     known_config: str = "",
     job_size: int = 20,
 ) -> list[dict]:
@@ -406,7 +442,7 @@ async def _discover_from_es(
         fips/ipsec/encrypted: Filter on respective fields ("true"/"false").
         organization/repository: Filter on org/repo fields (for PR queries).
         workload: Job name wildcard (e.g. "data-path", "netpol").
-        benchmark: Filter on benchmark.keyword.
+        benchmarks: Filter on benchmark.keyword (exact match, any in list).
         known_config: Skip _select_config and use this config directly.
         job_size: Max number of job buckets in aggregation.
 
@@ -443,8 +479,8 @@ async def _discover_from_es(
         must_clauses.append({"term": {"repository.keyword": repository}})
     if workload:
         must_clauses.append({"wildcard": {"upstreamJob.keyword": {"value": f"*{workload}*"}}})
-    if benchmark:
-        must_clauses.append({"wildcard": {"benchmark.keyword": {"value": f"*{benchmark}*"}}})
+    if benchmarks:
+        must_clauses.append({"terms": {"benchmark.keyword": benchmarks}})
 
     query = {
         "size": 0,
@@ -574,16 +610,15 @@ def get_data_source_resource() -> str:
 @mcp.tool()
 async def get_release_date(
     version : Annotated[str, Field(description="OCP Version to get Release date")] = "4.20") -> str:
-    """
-    Get the release date for a given OpenShift version.
+    """Look up when an OpenShift version was released (GA date). Use when a user asks "when did X release" or "what is the release date for X".
+
+    Triggers: "when did 4.19 release", "release date for 4.20", "when was 5.0 GA".
 
     Args:
-        version: OpenShift version to get the release date for.
-        Defaults to 4.20.
+        version: OpenShift version (default: '4.20').
 
     Returns:
-        The release date for the given OpenShift version.
-        If the version is not a valid OpenShift version, returns "Invalid version: {version}".
+        Release date string or "Invalid version".
     """
     if version in RELEASE_DATES :
         return RELEASE_DATES[version]
@@ -591,8 +626,12 @@ async def get_release_date(
 
 @mcp.tool()
 def get_orion_configs() -> list[str]:
-    """
-    Return the list of Orion config filenames (not full paths).
+    """List all available benchmark config files. Use when a user asks "what benchmarks exist", "list configs", or "what workloads can I test".
+
+    Triggers: "what configs are available", "list benchmarks", "show all workloads".
+
+    Returns:
+        List of config filenames (e.g. ['cluster-density.yaml', 'node-density.yaml', ...]).
     """
     return orion_configs(ORION_CONFIGS)
 
@@ -629,14 +668,21 @@ async def discover_jobs(
     encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs (filters on ES 'encrypted' field).")] = False,
     ctx: Context = None,
 ) -> dict:
-    """Discover CI jobs, benchmarks, and cluster metadata from Elasticsearch.
+    """Find what CI jobs are running in Elasticsearch for a given version, platform, or workload. Use when a user asks "what jobs run for 4.20", "show CI jobs on rosa-hcp", or "what benchmarks are running".
 
-    Queries ES using indexed field filters (platform, fips, workerNodesCount, etc.).
-    Defaults: periodic AWS 6-node jobs with fips/ipsec/encrypted=false.
-    When platform is given without workload, shows all jobs on that platform.
-    Modifiers (fips/ipsec/scale/encrypted) auto-scope to control-plane jobs.
+    Triggers: "what jobs run on 4.22", "list jobs for rosa-hcp", "what payload jobs exist",
+    "show CI jobs for fips", "what benchmarks run on metal".
 
-    Returns dict with 'success', 'search' (filters used), and 'jobs' list with benchmarks and metadata.
+    Args:
+        version: OpenShift version prefix (default: '4.19').
+        lookback: Days to look back (default: 30).
+        platform: Cloud platform — 'aws', 'rosa-hcp', 'gcp', 'metal' (default: 'aws' 6-node payload).
+        workload: Substring matched against CI job name (default: empty = 6-node payload jobs).
+        scale: Worker node count — '3', '6', '9', '24', '120', '252' (default: empty).
+        fips/ipsec/encrypted: Boolean filters (default: false).
+
+    Returns:
+        Dict with 'success', 'search' (filters, job count), and 'jobs' (list with benchmark, config, cluster metadata).
     """
     _extract_and_set_es_server(ctx)
 
@@ -670,17 +716,18 @@ async def get_orion_metrics(
     input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
     ctx: Context = None,
 ) -> dict:
-    """Return the list of metrics available for a specific Orion *config*.
+    """List what metrics a benchmark tracks. Use when a user asks "what metrics does cluster-density have" or "list metrics for node-density".
+
+    Triggers: "what metrics does cluster-density track", "list metrics for node-density",
+    "what can I measure for this config".
 
     Args:
-        config_name: **Filename** of the Orion configuration to query (not the full path).
-        version: OpenShift version used to query metrics.
-        input_vars: JSON string of template variables for config rendering.
-        ctx: MCP context for accessing request headers
+        config_name: Orion config filename (default: 'cluster-density.yaml').
+        version: OpenShift version (default: '4.20').
+        input_vars: JSON template variables (default: empty, auto-discovered from ES).
 
     Returns:
-        A dictionary where the key is the *config* (full path) and the value is a
-        list of metric names available for that configuration.
+        Dict keyed by config with list of metric names.
     """
     effective_config, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
 
@@ -706,16 +753,18 @@ async def get_orion_metrics_with_meta(
     input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
     ctx: Context = None,
 ) -> dict:
-    """Return metrics and metadata for a specific Orion *config*.
+    """Get metric details including thresholds, directions (higher-is-better or lower-is-better), and labels for a benchmark. Use when a user asks "what are the thresholds", "which direction is good for ovnCPU", or "show metric metadata".
+
+    Triggers: "what are the metric thresholds for cluster-density", "which metrics are higher-is-better",
+    "show metric details".
 
     Args:
-        config_name: **Filename** of the Orion configuration to query (not the full path).
-        version: OpenShift version used to render the config template.
-        input_vars: JSON string of template variables for config rendering.
-        ctx: MCP context for accessing request headers
+        config_name: Orion config filename (default: 'cluster-density.yaml').
+        version: OpenShift version (default: '4.19').
+        input_vars: JSON template variables (default: empty, auto-discovered from ES).
 
     Returns:
-        A dictionary with "metrics" (list) and "meta" (per-metric metadata).
+        Dict with "metrics" (list of names) and "meta" (per-metric label, direction, threshold).
     """
     effective_config, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
     try:
@@ -752,177 +801,87 @@ async def openshift_report_on(
         Field(description="Orion configuration file name (e.g. 'cluster-density.yaml')"),
     ] = None,
     input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
-    options: Annotated[str, Field(description="Options in format 'output_format' or 'output_format:display_field'. Examples: 'image', 'json', 'both', 'json:ocpVirtVersion'")] = "image",
     ctx: Context = None,
-) -> types.ImageContent | types.TextContent:
-    """
-    Captures a performance analysis against the specified OpenShift version using Orion.
+) -> dict:
+    """Compare or fetch a specific metric across OpenShift versions in a single call. Pass metric name and comma-separated versions (e.g. versions='4.22,5.0', metric='podReadyLatency_P99'). Config is auto-discovered — no need to look up configs or metrics first.
 
-    Orion uses an EDivisive algorithm to analyze performance data from a specified
-    configuration file to detect any performance regressions.
+    Triggers: "compare podReadyLatency_P99 for 4.22 vs 5.0", "show ovnCPU_avg values for 4.20",
+    "get podReadyLatency data", "etcdCPU numbers for 4.22 and 5.0".
 
     Args:
-        versions: Comma-separated list of OpenShift versions to analyze.
-        lookback: The number of days to look back for performance data. Defaults to 15 days.
-        since: The date to begin looking back for performance data. Defaults to None.
-        metric: The metric to analyze. Defaults to podReadyLatency_P99.
-        config_name: The config to analyze. Defaults to cluster-density.yaml.
-        input_vars: JSON string of template variables for config rendering.
-        options: Output format and optional display field. Format: 'output_format' or
-                'output_format:display_field'. Examples: 'image', 'json:ocpVirtVersion'.
+        versions: Comma-separated versions (default: '4.19'). Example: '4.22,5.0' for multi-version comparison.
+        lookback: Days to look back (default: '15').
+        since: Start date for lookback (default: None).
+        metric: Metric to return (default: 'podReadyLatency_P99').
+        config_name: Orion config filename (default: 'cluster-density.yaml', auto-discovered from ES if omitted).
+        input_vars: JSON template variables (default: empty, auto-discovered from ES).
 
     Returns:
-        Returns an image showing the performance overtime, or JSON data based on options.
+        Dict with config, metric, and per-version data.
+        Each version has: values (flat list of floats) and runs (list with timestamp, ocpVersion, buildUrl).
+        values[i] corresponds to runs[i].
     """
-    # Parse options to extract output_format and display
-    if ":" in options:
-        output_format, display = options.split(":", 1)
-    else:
-        output_format = options
-        display = ""
+    _extract_and_set_es_server(ctx)
 
-    # Parse versions into list
     if isinstance(versions, str):
         version_list = [v.strip() for v in versions.split(',') if v.strip()]
     else:
         version_list = list(versions)
 
-    config_value, iv, _ = await _resolve_config_and_vars(ctx, config_name, version_list[0], input_vars)
+    config_value, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version_list[0], input_vars)
 
-    series: dict[str, list[float]] = {}
-    full_data: dict[str, dict] = {}
+    output: dict = {
+        "config": config_value,
+        "metric": metric,
+        "versions": {},
+    }
+    if search_info:
+        output["search"] = search_info
 
     errors = []
     for ver in version_list:
+        ver_iv = dict(iv, version=ver) if iv else None
         result = await run_orion(
             config=ORION_CONFIGS_PATH + config_value,
             version=ver,
             lookback=lookback,
             since=since,
-            input_vars=iv,
-            display=display if display.strip() else None,
+            input_vars=ver_iv,
         )
 
         sum_result = await summarize_result(result, isolate=metric)
 
-        # Ensure we have the expected structure before indexing
         if not isinstance(sum_result, dict) or metric not in sum_result:
             errors.append(f"No data for version {ver}: {sum_result}")
             continue
 
-        raw_values = sum_result[metric].get("value", [])  # type: ignore[assignment]
+        raw_values = sum_result[metric].get("value", [])
         if not isinstance(raw_values, list):
             errors.append(f"Unexpected data format for version {ver}")
             continue
 
-        # Remove None values to keep the plot continuous
         values = [v for v in raw_values if v is not None]
         if not values:
             errors.append(f"All values are None for version {ver}")
             continue
 
-        series[ver] = values
-        full_data[ver] = sum_result
+        runs_context = []
+        for run in sum_result.get("runs", []):
+            runs_context.append({
+                "timestamp": run.get("timestamp"),
+                "ocpVersion": run.get("ocpVersion"),
+                "buildUrl": run.get("buildUrl"),
+            })
 
-    if errors and not series:
-        return types.TextContent(type="text", text="\n".join(errors))
+        output["versions"][ver] = {"values": values, "runs": runs_context}
 
-    # Handle different output formats
-    if output_format.lower() == "json":
-        # Return JSON data
-        json_output = {
-            "config": config_value,
-            "metric": metric,
-            "lookback": lookback,
-            "display": display if display.strip() else None,
-            "data": full_data
-        }
-        return types.TextContent(type="text", text=json.dumps(json_output, indent=2))
+    if errors:
+        output["errors"] = errors
+    if not output["versions"]:
+        output["error"] = "No data found for any version"
 
-    if output_format.lower() == "both":
-        # Return both JSON and image info
-        json_output = {
-            "config": config_value,
-            "metric": metric,
-            "lookback": lookback,
-            "display": display if display.strip() else None,
-            "data": full_data,
-            "plot_info": "Image data follows JSON data"
-        }
-        try:
-            img_b64 = generate_multi_line_plot(series, metric, title_prefix=f"{config_value}: ")
-            combined_output = json.dumps(json_output, indent=2) + "\n\n[IMAGE_DATA_BASE64]\n" + img_b64.decode("utf-8")
-            return types.TextContent(type="text", text=combined_output)
-        except ValueError as e:
-            return types.TextContent(type="text", text=f"Error generating plot: {str(e)}\n\nJSON data:\n{json.dumps(json_output, indent=2)}")
+    return output
 
-    else:
-        # Default: return image
-        try:
-            img_b64 = generate_multi_line_plot(series, metric, title_prefix=f"{config_value}: ")
-            return types.ImageContent(type="image", data=img_b64.decode("utf-8"), mimeType="image/jpeg")
-        except ValueError as e:
-            return types.TextContent(type="text", text=str(e))
-
-
-@mcp.tool()
-async def get_orion_performance_data(
-    config_name: Annotated[
-        str | None,
-        Field(
-            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
-        ),
-    ] = None,
-    *,
-    metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
-    version: Annotated[str, Field(description="OpenShift version to analyze")] = "4.19",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
-    since: Annotated[str | None, Field(description="Date to begin looking back for performance data")] = None,
-    input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
-    ctx: Context = None,
-) -> dict:
-    """Return performance data values for a specific config/metric/version.
-
-    Returns:
-        Dict with config, metric, version, lookback, values, count.
-    """
-    config_value, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
-
-    try:
-        result = await run_orion(
-            config=ORION_CONFIGS_PATH + config_value,
-            version=version,
-            lookback=lookback,
-            since=since,
-            input_vars=iv,
-        )
-        sum_result = await summarize_result(result, isolate=metric)
-
-        if not isinstance(sum_result, dict) or metric not in sum_result:
-            resp = {"error": f"No data found for metric {metric}"}
-            if search_info:
-                resp["search"] = search_info
-            return resp
-
-        metric_data = sum_result[metric]
-        values = metric_data.get("value", [])
-        if not isinstance(values, list):
-            return {"error": f"Unexpected data format for metric {metric}"}
-
-        values = [v for v in values if v is not None]
-        resp = {
-            "config": config_value,
-            "metric": metric,
-            "version": version,
-            "lookback": lookback,
-            "values": values,
-            "count": len(values),
-        }
-        if search_info:
-            resp["search"] = search_info
-        return resp
-    except Exception as e:
-        return {"error": str(e)}
 
 def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
     """Calculate and set percentage_change on each metric in pull data."""
@@ -947,6 +906,62 @@ def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
                     metric_data["percentage_change"] = ((pull_value - periodic_value) / periodic_value) * 100
                 else:
                     metric_data["percentage_change"] = None
+
+
+def _flatten_pr_summary(summaries: list[dict]) -> list[dict]:
+    results = []
+    for summary in summaries:
+        config_name = os.path.basename(summary.get("config", "unknown"))
+
+        if "error" in summary:
+            results.append({"config": config_name, "error": summary["error"]})
+            continue
+
+        periodic_avg = summary.get("periodic_avg", {})
+        pulls_list = summary.get("pulls", [])
+
+        # Normalize baselines once
+        baselines = {}
+        for metric_name, raw in periodic_avg.items():
+            val = raw.get("value") if isinstance(raw, dict) else raw
+            baselines[metric_name] = round(val, 4) if isinstance(val, float) else val
+
+        # Build per-PR runs
+        pr_runs = []
+        for pull_obj in pulls_list:
+            pr_num = pull_obj.get("pull_number", "")
+            for dat in pull_obj.get("data", []):
+                run_metrics = []
+                for metric_name, metric_data in sorted(dat.get("metrics", {}).items()):
+                    pr_val = metric_data.get("value")
+                    if isinstance(pr_val, float):
+                        pr_val = round(pr_val, 4)
+                    pct = metric_data.get("percentage_change")
+                    if isinstance(pct, float):
+                        pct = round(pct, 2)
+                    run_metrics.append({
+                        "name": metric_name,
+                        "baseline": baselines.get(metric_name),
+                        "pr_value": pr_val,
+                        "change_pct": pct,
+                    })
+                pr_runs.append({
+                    "pull_number": pr_num,
+                    "buildUrl": dat.get("buildUrl"),
+                    "timestamp": dat.get("timestamp"),
+                    "metrics": run_metrics,
+                })
+
+        if not pr_runs:
+            results.append({"config": config_name, "error": "No PR test data"})
+            continue
+
+        results.append({
+            "config": config_name,
+            "runs": pr_runs,
+        })
+
+    return results
 
 
 async def get_pr_details(
@@ -1016,11 +1031,14 @@ async def get_pr_details(
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as e:
+            stderr_snippet = (result.stderr or result.stdout or "")[:200].strip()
             print(f"Failed to parse orion output for {full_config_path}: {e}")
+            summaries.append({"config": full_config_path, "error": f"Orion failed (exit {result.returncode}): {stderr_snippet}"})
             continue
 
         if not isinstance(data, dict):
             print(f"Unexpected data type from orion for {full_config_path}: {type(data)}")
+            summaries.append({"config": full_config_path, "error": f"Unexpected data type: {type(data).__name__}"})
             continue
 
         if "periodic_avg" not in data:
@@ -1044,7 +1062,7 @@ async def get_pr_details(
                     metric_data.pop("labels", None)
 
         summaries.append({
-            "config": config,
+            "config": full_config_path,
             "periodic_avg": periodic_avg,
             "pulls": pulls_list,
         })
@@ -1061,24 +1079,28 @@ async def openshift_report_on_pr(
     pull_request: Annotated[str, Field(description="PR number to analyze (for single PR)")] = "2841",
     pull_requests: Annotated[str, Field(description="Comma-separated PR numbers to compare (e.g. '3169,3170'). Overrides pull_request if provided.")] = "",
     ctx: Context = None,
-) -> dict:
-    """
-    Captures a performance analysis against the specified OpenShift version using Orion.
+) -> list[dict]:
+    """Analyze how a GitHub pull request affected CI performance by comparing PR test runs against periodic baselines. Use when a user says "analyze PR", "check PR impact", or provides a PR number or GitHub PR URL. Input: PR number + org/repo.
+
+    Triggers: "analyze pr 3332", "analyze pr https://github.com/openshift/ovn-kubernetes/pull/3332",
+    "how did PR 3317 affect performance", "check PR impact on 5.0".
+
+    Compares PR CI test runs against periodic baseline averages.
 
     Args:
-        version: OpenShift version to analyze.
-        lookback: The number of days to look back for performance data. Defaults to 15 days.
-        organization: The organization to look into. Defaults to openshift.
-        repository: The repository to look into. Defaults to ovn-kubernetes.
-        pull_request: Single PR number to analyze. Defaults to 2841.
-        pull_requests: Comma-separated PR numbers for multi-PR comparison (e.g. '3169,3170').
-            When provided, overrides pull_request.
-        ctx: MCP context for accessing request headers
+        version: OpenShift version to compare against (default: '4.20').
+        lookback: Days to look back (default: '15').
+        organization: GitHub organization (default: 'openshift').
+        repository: GitHub repository (default: 'ovn-kubernetes').
+        pull_request: Single PR number (default: '2841').
+        pull_requests: Comma-separated PR numbers for multi-PR comparison (default: empty).
 
     Returns:
-        Dictionary with summaries containing PR analysis results for each config.
+        List grouped by config. Each entry has config and runs (list of per-PR-run results).
+        Each run has: pull_number, buildUrl, timestamp, and metrics list.
+        Each metric has: name, baseline, pr_value, change_pct.
+        Error entries have: config, error.
     """
-    # Extract and set ES_SERVER from request headers if present
     _extract_and_set_es_server(ctx)
 
     if pull_requests and pull_requests.strip():
@@ -1087,14 +1109,7 @@ async def openshift_report_on_pr(
         pr_list = [pull_request]
 
     summaries = await get_pr_details(organization, repository, pr_list, version, lookback)
-    if not summaries:
-        return {
-            "summaries": [],
-            "message": "No performance data found for this PR. Please ensure the PR has been tested and the version is correct."
-        }
-    return {
-        "summaries": summaries
-    }
+    return _flatten_pr_summary(summaries)
 
 
 def _extract_regression_details(stdout: str) -> list[dict]:
@@ -1154,31 +1169,39 @@ async def _run_regression_checks(
             jira_status_filter="Done",
         )
 
-        if result.returncode not in (0, 3):
-            config_short = os.path.basename(full_config_path)
+        config_short = os.path.basename(full_config_path)
+        if result.returncode == 3:
+            continue
+
+        try:
             details = _extract_regression_details(result.stdout)
-            for det in details:
-                header_lines = [
-                    f"⚠️ Change detected in configuration: '{config_short}'",
-                    f"OCP Version: {det.get('ocpVersion')}",
-                    f"Previous OCP Version: {det.get('previousOcpVersion')}",
-                ]
-                build_url = det.get("buildUrl")
-                if build_url:
-                    header_lines.append(f"Build URL: {build_url}")
-                header_lines.append("PRs added since Previous OCP Version:")
-                prs_added = det.get("prs_added") or []
-                if prs_added:
-                    header_lines.extend([f"  - {pr}" for pr in prs_added])
-                else:
-                    header_lines.append("  - None")
+        except (json.JSONDecodeError, TypeError):
+            stderr_snippet = (result.stderr or result.stdout or "")[:200].strip()
+            changepoints.append(f"❌ Error: Orion failed for {config_short} (exit {result.returncode}): {stderr_snippet}")
+            continue
 
-                metrics_list = det.get("metrics", [])
-                if metrics_list:
-                    header_lines.append("Affected metrics:")
-                    header_lines.extend([f"  - {m}" for m in metrics_list])
+        for det in details:
+            header_lines = [
+                f"⚠️ Change detected in configuration: '{config_short}'",
+                f"OCP Version: {det.get('ocpVersion')}",
+                f"Previous OCP Version: {det.get('previousOcpVersion')}",
+            ]
+            build_url = det.get("buildUrl")
+            if build_url:
+                header_lines.append(f"Build URL: {build_url}")
+            header_lines.append("PRs added since Previous OCP Version:")
+            prs_added = det.get("prs_added") or []
+            if prs_added:
+                header_lines.extend([f"  - {pr}" for pr in prs_added])
+            else:
+                header_lines.append("  - None")
 
-                changepoints.append("\n".join(header_lines))
+            metrics_list = det.get("metrics", [])
+            if metrics_list:
+                header_lines.append("Affected metrics:")
+                header_lines.extend([f"  - {m}" for m in metrics_list])
+
+            changepoints.append("\n".join(header_lines))
 
     if changepoints:
         return "\n\n".join(changepoints)
@@ -1250,14 +1273,25 @@ async def has_openshift_regressed(
     encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     ctx: Context = None,
 ) -> str:
-    """Runs performance regression analysis against OpenShift using Orion.
+    """Check if an OpenShift version has performance regressions using changepoint detection across all benchmarks. Use when a user asks "has X regressed", "check for regressions", or "any regressions in version X". Input: version like '4.20' or '5.0'.
 
-    Discovers CI jobs from Elasticsearch using indexed field filters, then runs
-    EDivisive changepoint detection on each discovered config.
+    Triggers: "has 4.22 regressed", "check regressions for 5.0", "any regressions on rosa-hcp",
+    "are there regressions in 4.20".
 
-    Defaults when nothing specified: periodic AWS 6-node jobs (fips/ipsec/encrypted=false).
+    Runs EDivisive changepoint detection on all discovered configs for that version.
 
-    Returns string with search context and regression results.
+    Args:
+        version: OpenShift version (default: '4.19').
+        lookback: Days to look back (default: '15').
+        configs: Comma-separated config files (default: empty, auto-discovered from ES).
+        platform: Cloud platform — 'aws', 'rosa-hcp', 'gcp', 'metal' (default: 'aws' 6-node payload).
+        workload: Substring matched against CI job name (default: empty).
+        scale: Worker node count (default: empty).
+        fips/ipsec/encrypted: Boolean filters (default: false).
+
+    Returns:
+        Search filters header + changepoint details (config, version, PRs, metrics with % change)
+        or "No changepoints found".
     """
     _extract_and_set_es_server(ctx)
     return await _discover_and_check_regressions(
@@ -1280,12 +1314,24 @@ async def has_networking_regressed(
     encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     ctx: Context = None,
 ) -> str:
-    """Runs regression analysis on networking-focused benchmarks.
+    """Check if networking benchmarks (node-density-cni, udn-*) have regressed for an OpenShift version. Use when a user specifically asks about networking, CNI, or UDN regressions. Input: version like '4.20'.
 
-    Discovers CI jobs from Elasticsearch, then filters to networking-related
-    benchmarks (node-density-cni, udn-*).
+    Triggers: "has networking regressed in 4.22", "check networking regressions",
+    "any CNI or UDN regressions in 5.0".
 
-    Returns string with search context and regression results.
+    Same as has_openshift_regressed but filtered to networking-related benchmarks only.
+
+    Args:
+        version: OpenShift version (default: '4.19').
+        lookback: Days to look back (default: '15').
+        configs: Comma-separated config files (default: empty, auto-discovered from ES).
+        platform: Cloud platform — 'aws', 'rosa-hcp', 'gcp', 'metal' (default: 'aws').
+        workload: Substring matched against CI job name (default: empty).
+        scale: Worker node count (default: empty).
+        fips/ipsec/encrypted: Boolean filters (default: false).
+
+    Returns:
+        Search filters header + changepoint details or "No changepoints found".
     """
     _extract_and_set_es_server(ctx)
 
@@ -1319,13 +1365,22 @@ async def metrics_correlation(
     input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
     ctx: Context = None,
 ) -> types.ImageContent | types.TextContent:
-    """
-    Calculate and visualise the correlation between two metrics for a given
-    Orion configuration.
+    """Check if two metrics are correlated by computing Pearson coefficient and plotting a scatter chart. Use when a user asks "are these metrics related", "correlate X with Y", or "is ovnCPU correlated with podReadyLatency". Input: two metric names.
 
-    A scatter-plot annotated with the Pearson correlation coefficient is
-    returned. If either metric is missing from the Orion results the function
-    falls back to returning a textual error message.
+    Triggers: "correlate podReadyLatency with ovnCPU", "are ovnCPU and etcdCPU related",
+    "is there a correlation between X and Y".
+
+    Args:
+        metric1: First metric, Y-axis (default: 'podReadyLatency_P99').
+        metric2: Second metric, X-axis (default: 'ovnCPU_avg').
+        config_name: Orion config filename (default: 'cluster-density.yaml', auto-discovered from ES if omitted).
+        since: Start date for lookback (default: None).
+        version: OpenShift version (default: '4.19').
+        lookback: Days to look back (default: '15').
+        input_vars: JSON template variables (default: empty, auto-discovered from ES).
+
+    Returns:
+        ImageContent (scatter-plot PNG) or TextContent (error).
     """
     config_value, iv, _ = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
 
@@ -1363,7 +1418,7 @@ async def metrics_correlation(
 async def has_nightly_regressed(
     nightly_version: Annotated[str, Field(description="Full nightly version string (e.g., '4.22.0-0.nightly-2026-01-05-203335')")],
     previous_nightly: Annotated[str, Field(description="Optional previous nightly to compare against (e.g., '4.22.0-0.nightly-2026-01-01-123456')")] = "",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "30",
+    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
     configs: Annotated[str, Field(description="Comma-separated list of config files (optional, auto-discovered if empty)")] = "",
     platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
     workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol'.")] = "",
@@ -1373,14 +1428,24 @@ async def has_nightly_regressed(
     encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
     ctx: Context = None,
 ) -> str:
-    """Detect regressions for a specific OpenShift nightly version.
+    """Check if a specific nightly build has regressions by running changepoint detection scoped to that build's time window. Use when a user provides a full nightly version string and asks "inspect this nightly", "has this nightly regressed", or "check nightly X". Input: full nightly string like '5.0.0-0.nightly-2026-08-10-122052'.
 
-    Discovers CI jobs from Elasticsearch using indexed field filters, then runs
-    changepoint detection filtered to the nightly date.
+    Triggers: "inspect nightly 5.0.0-0.nightly-2026-08-10-122052", "has this nightly regressed",
+    "check nightly build", "compare nightly X vs Y".
 
-    Defaults when nothing specified: periodic AWS 6-node jobs (fips/ipsec/encrypted=false).
+    Args:
+        nightly_version: Full nightly string (required, e.g. '4.22.0-0.nightly-2026-01-05-203335').
+        previous_nightly: Earlier nightly to scope the comparison window (default: empty).
+        lookback: Days to look back (default: '15').
+        configs: Comma-separated config files (default: empty, auto-discovered from ES).
+        platform: Cloud platform — 'aws', 'rosa-hcp', 'gcp', 'metal' (default: 'aws' 6-node payload).
+        workload: Substring matched against CI job name (default: empty).
+        scale: Worker node count (default: empty).
+        fips/ipsec/encrypted: Boolean filters (default: false).
 
-    Returns string with search context and regression details.
+    Returns:
+        Search filters header + regression details (config, version, PRs, metrics with % change)
+        or "No regressions found".
     """
     _extract_and_set_es_server(ctx)
 
@@ -1444,13 +1509,18 @@ async def has_nightly_regressed(
 
         try:
             data = json.loads(result.stdout)
-            if not isinstance(data, list):
-                continue
-            data = filter_data_by_timestamp(data, nightly_info.nightly_date)
-            if prev_nightly_info:
-                data = [e for e in data if e.get("timestamp") and _timestamp_after(e["timestamp"], prev_nightly_info.nightly_date)]
         except (json.JSONDecodeError, TypeError):
+            stderr_snippet = (result.stderr or result.stdout or "")[:200].strip()
+            all_regressions.append(f"❌ Error: Orion failed for {config} (exit {result.returncode}): {stderr_snippet}")
             continue
+
+        if not isinstance(data, list):
+            all_regressions.append(f"❌ Error: Orion returned unexpected data type for {config}: {type(data).__name__}")
+            continue
+
+        data = filter_data_by_timestamp(data, nightly_info.nightly_date)
+        if prev_nightly_info:
+            data = [e for e in data if e.get("timestamp") and _timestamp_after(e["timestamp"], prev_nightly_info.nightly_date)]
 
         details = _extract_regression_details(json.dumps(data))
         for det in details:
@@ -1521,27 +1591,38 @@ async def get_performance_summary(
     )] = None,
     ctx: Context = None,
 ) -> dict:
-    """Get a complete performance summary in one call.
+    """Broad health check for a version — aggregated stats (min, max, avg, change%) across ALL metrics and ALL benchmarks. Only for broad questions like "how is 4.22 doing" — NOT for named metrics like podReadyLatency or ovnCPU.
 
-    Discovers jobs, runs Orion analysis for each config, and computes
-    per-metric statistics (min, max, avg, change%).
+    Triggers: "how is 4.22 doing overall", "give me a health check for 5.0",
+    "is 4.20 healthy", "overall performance report for 4.22".
 
-    Defaults: periodic AWS 6-node jobs (fips/ipsec/encrypted=false).
-    When platform is given, analyzes all jobs on that platform.
-    Modifiers (fips/ipsec/scale/encrypted) auto-scope to control-plane jobs.
+    Discovers jobs from ES, runs Orion for each config, computes stats with change% vs prior period.
+
+    Args:
+        version: OpenShift version (default: '4.19').
+        lookback: Days to look back (default: 14).
+        platform: Cloud platform — 'aws', 'rosa-hcp', 'gcp', 'metal' (default: 'aws' 6-node payload).
+        workload: Substring matched against CI job name (default: empty).
+        scale: Worker node count (default: empty).
+        fips/ipsec/encrypted: Boolean filters (default: false).
+        config_name: Specific config file (default: None, all configs auto-discovered from ES).
+
+    Returns:
+        Dict with 'success', 'search', and 'configs' (per-benchmark stats:
+        min, max, avg, change_percent, direction, threshold per metric).
     """
     _extract_and_set_es_server(ctx)
 
-    es_benchmark = ""
+    es_benchmarks = []
     if config_name:
-        es_benchmark = _CONFIG_TO_BENCHMARK.get(config_name, "")
-        if not es_benchmark:
+        es_benchmarks = _CONFIG_TO_BENCHMARKS.get(config_name, [])
+        if not es_benchmarks:
             return {"success": False, "search": {"message": f"No benchmark mapping found for config '{config_name}'"}, "configs": []}
 
     configs_to_run, filters_used, jobs_for_search = await _discover_configs_with_vars(
         version, platform=platform, workload=workload, scale=scale,
         fips=fips, ipsec=ipsec, encrypted=encrypted,
-        es_benchmark=es_benchmark,
+        es_benchmarks=es_benchmarks,
     )
 
     if config_name:
