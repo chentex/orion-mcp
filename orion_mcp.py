@@ -214,13 +214,17 @@ def _select_config(benchmark: str, upstream_job: str = "") -> str | None:
 
 
 def _parse_input_vars(input_vars: str) -> dict | None:
-    """Parse a JSON input_vars string into a dict, or return None if empty."""
+    """Parse a JSON input_vars string into a dict, or return None if empty.
+
+    Raises ValueError on malformed JSON so callers can distinguish
+    "not provided" (None) from "provided but broken".
+    """
     if not input_vars:
         return None
     try:
         return json.loads(input_vars)
-    except (json.JSONDecodeError, TypeError):
-        return None
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"Malformed input_vars JSON: {exc}") from exc
 
 
 DEFAULT_CONFIG = "cluster-density.yaml"
@@ -245,8 +249,12 @@ async def _resolve_config_and_vars(
     """
     _extract_and_set_es_server(ctx)
     config_value = config_name or DEFAULT_CONFIG
-    iv = _parse_input_vars(input_vars)
     search_info = {}
+    try:
+        iv = _parse_input_vars(input_vars)
+    except ValueError as exc:
+        search_info["input_vars_error"] = str(exc)
+        iv = None
     if iv is None:
         iv, search_info = await _discover_input_vars_for_config(
             config_value, version,
