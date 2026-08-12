@@ -58,6 +58,28 @@ FULL_ORION_CONFIG_PATHS = [os.path.join(ORION_CONFIGS_PATH, config) for config i
 
 logger = logging.getLogger(__name__)
 
+# Common parameter types — define once, reuse across all tools
+PlatformParam = Annotated[str, Field(
+    description="Cloud platform: 'aws', 'rosa-hcp', 'rosa', 'gcp', 'azure', 'metal'. Filters ES job discovery.",
+)]
+WorkloadParam = Annotated[str, Field(
+    description="Workload filter — substring match on job name: 'control-plane', 'data-path', 'udn-density-l3'.",
+)]
+ScaleParam = Annotated[str, Field(
+    description="Worker node count: '6', '24', '120', '252'.",
+)]
+FipsParam = Annotated[bool, Field(description="Filter for FIPS-enabled jobs.")]
+IpsecParam = Annotated[bool, Field(description="Filter for IPsec-enabled jobs.")]
+EncryptedParam = Annotated[bool, Field(description="Filter for etcd-encrypted jobs.")]
+VersionParam = Annotated[str, Field(description="OpenShift version (e.g. '4.22', '5.0')")]
+LookbackParam = Annotated[str, Field(description="Number of days to lookback")]
+ConfigParam = Annotated[str | None, Field(
+    description="Orion configuration file name (e.g. 'cluster-density.yaml'). Auto-discovered from ES if omitted.",
+)]
+InputVarsParam = Annotated[str, Field(
+    description="JSON string of template variables for the config (e.g. platform, workerNodesCount). Auto-discovered from ES if omitted.",
+)]
+
 
 class _SafePlaceholder(jinja2.Undefined):
     """Returns safe placeholder values so config YAML can be parsed without real variables."""
@@ -209,6 +231,13 @@ async def _resolve_config_and_vars(
     config_name: str | None,
     version: str,
     input_vars: str = "",
+    *,
+    platform: str = "",
+    workload: str = "",
+    scale: str = "",
+    fips: bool = False,
+    ipsec: bool = False,
+    encrypted: bool = False,
 ) -> tuple[str, dict | None, dict]:
     """Common setup for tools: extract ES config, resolve config name, discover input_vars.
 
@@ -219,7 +248,11 @@ async def _resolve_config_and_vars(
     iv = _parse_input_vars(input_vars)
     search_info = {}
     if iv is None:
-        iv, search_info = await _discover_input_vars_for_config(config_value, version)
+        iv, search_info = await _discover_input_vars_for_config(
+            config_value, version,
+            platform=platform, workload=workload, scale=scale,
+            fips=fips, ipsec=ipsec, encrypted=encrypted,
+        )
     return config_value, iv, search_info
 
 
@@ -392,6 +425,13 @@ def _build_search_block(
 async def _discover_input_vars_for_config(
     config_file: str,
     version: str,
+    *,
+    platform: str = "",
+    workload: str = "",
+    scale: str = "",
+    fips: bool = False,
+    ipsec: bool = False,
+    encrypted: bool = False,
 ) -> tuple[dict | None, dict]:
     """Discover input_vars for a single config via ES job discovery.
 
@@ -404,6 +444,8 @@ async def _discover_input_vars_for_config(
 
     discovered, filters_used, jobs = await _discover_configs_with_vars(
         version, es_benchmarks=benchmarks, known_config=config_file,
+        platform=platform, workload=workload, scale=scale,
+        fips=fips, ipsec=ipsec, encrypted=encrypted,
     )
     for entry in discovered:
         if entry["config"] == config_file:
@@ -647,34 +689,14 @@ def get_orion_configs() -> list[str]:
 
 @mcp.tool()
 async def discover_jobs(
-    version: Annotated[str, Field(description="OpenShift version prefix (e.g. '4.18', '4.19', '4.20', '4.21', '4.22', '5.0')")] = "4.19",
+    version: VersionParam = "4.19",
     lookback: Annotated[int, Field(description="Number of days to look back for job runs")] = 30,
-    platform: Annotated[str, Field(
-        description=(
-            "Cloud platform filter (filters on ES 'platform' and 'clusterType' fields). "
-            "Values: 'aws' (default), 'rosa-hcp' (ROSA HCP managed), "
-            "'rosa' (ROSA classic), 'gcp', 'azure', 'metal' (bare-metal). "
-            "When specified without workload, returns ALL jobs on that platform. "
-            "When omitted, defaults to AWS 6-node payload jobs."
-        ),
-    )] = "",
-    workload: Annotated[str, Field(
-        description=(
-            "Workload filter — matched as substring in CI job name (only filter not using an indexed field). "
-            "Common values: 'control-plane', 'data-path', 'node-density-heavy', "
-            "'netpol', 'udn-density-l3', 'udn-bgp', 'olmv1', 'loaded-upgrade'. "
-            "When omitted and no other modifier is set, defaults to 6-node payload jobs."
-        ),
-    )] = "",
-    scale: Annotated[str, Field(
-        description=(
-            "Cluster worker node count (filters on ES 'workerNodesCount' field). "
-            "Values: '3', '6' (payload), '9' (data-path), '24', '120', '249', '252'."
-        ),
-    )] = "",
-    fips: Annotated[bool, Field(description="Filter for FIPS-enabled jobs (filters on ES 'fips' field).")] = False,
-    ipsec: Annotated[bool, Field(description="Filter for IPSec-enabled jobs (filters on ES 'ipsec' field).")] = False,
-    encrypted: Annotated[bool, Field(description="Filter for etcd-encrypted jobs (filters on ES 'encrypted' field).")] = False,
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
     ctx: Context = None,
 ) -> dict:
     """Find what CI jobs are running in Elasticsearch for a given version, platform, or workload. Use when a user asks "what jobs run for 4.20", "show CI jobs on rosa-hcp", or "what benchmarks are running".
@@ -715,14 +737,9 @@ async def discover_jobs(
 
 @mcp.tool()
 async def get_orion_metrics(
-    config_name: Annotated[
-        str | None,
-        Field(
-            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
-        ),
-    ] = None,
-    version: Annotated[str, Field(description="OpenShift version used to query metrics")] = "4.20",
-    input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
+    config_name: ConfigParam = None,
+    version: VersionParam = "4.20",
+    input_vars: InputVarsParam = "",
     ctx: Context = None,
 ) -> dict:
     """List what metrics a benchmark tracks. Use when a user asks "what metrics does cluster-density have" or "list metrics for node-density".
@@ -752,14 +769,9 @@ async def get_orion_metrics(
 
 @mcp.tool()
 async def get_orion_metrics_with_meta(
-    config_name: Annotated[
-        str | None,
-        Field(
-            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
-        ),
-    ] = None,
-    version: Annotated[str, Field(description="OpenShift version used to render the config template")] = "4.19",
-    input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
+    config_name: ConfigParam = None,
+    version: VersionParam = "4.19",
+    input_vars: InputVarsParam = "",
     ctx: Context = None,
 ) -> dict:
     """Get metric details including thresholds, directions (higher-is-better or lower-is-better), and labels for a benchmark. Use when a user asks "what are the thresholds", "which direction is good for ovnCPU", or "show metric metadata".
@@ -801,21 +813,25 @@ async def get_orion_metrics_with_meta(
 @mcp.tool()
 async def openshift_report_on(
     versions: Annotated[str, Field(description="Comma-separated list of OpenShift versions e.g. '4.19,4.20'")] = "4.19",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
+    lookback: LookbackParam = "15",
     since: Annotated[str, Field(description="Date to begin lookback")] = None,
     *,
     metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
-    config_name: Annotated[
-        str | None,
-        Field(description="Orion configuration file name (e.g. 'cluster-density.yaml')"),
-    ] = None,
-    input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
+    config_name: ConfigParam = None,
+    input_vars: InputVarsParam = "",
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
     ctx: Context = None,
 ) -> dict:
     """Compare or fetch a specific metric across OpenShift versions in a single call. Pass metric name and comma-separated versions (e.g. versions='4.22,5.0', metric='podReadyLatency_P99'). Config is auto-discovered — no need to look up configs or metrics first.
 
     Triggers: "compare podReadyLatency_P99 for 4.22 vs 5.0", "show ovnCPU_avg values for 4.20",
-    "get podReadyLatency data", "etcdCPU numbers for 4.22 and 5.0".
+    "get podReadyLatency data", "etcdCPU numbers for 4.22 and 5.0",
+    "apiserverCPU on rosa-hcp", "podReadyLatency for fips 24-node".
 
     Args:
         versions: Comma-separated versions (default: '4.19'). Example: '4.22,5.0' for multi-version comparison.
@@ -824,6 +840,12 @@ async def openshift_report_on(
         metric: Metric to return (default: 'podReadyLatency_P99').
         config_name: Orion config filename (default: 'cluster-density.yaml', auto-discovered from ES if omitted).
         input_vars: JSON template variables (default: empty, auto-discovered from ES).
+        platform: Cloud platform filter (default: '' = AWS).
+        workload: Job name substring filter (default: '').
+        scale: Worker node count filter (default: '').
+        fips: FIPS filter (default: false).
+        ipsec: IPsec filter (default: false).
+        encrypted: Etcd encryption filter (default: false).
 
     Returns:
         Dict with config, metric, and per-version data.
@@ -838,7 +860,11 @@ async def openshift_report_on(
     if not version_list:
         return {"error": "No valid versions provided"}
 
-    config_value, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version_list[0], input_vars)
+    config_value, iv, search_info = await _resolve_config_and_vars(
+        ctx, config_name, version_list[0], input_vars,
+        platform=platform, workload=workload, scale=scale,
+        fips=fips, ipsec=ipsec, encrypted=encrypted,
+    )
 
     output: dict = {
         "config": config_value,
@@ -1280,15 +1306,15 @@ async def _discover_and_check_regressions(
 
 @mcp.tool()
 async def has_openshift_regressed(
-    version: Annotated[str, Field(description="Version of OpenShift to look into")] = "4.19",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
+    version: VersionParam = "4.19",
+    lookback: LookbackParam = "15",
     configs: Annotated[str, Field(description="Comma-separated list of config files to check (optional, auto-discovered if empty)")] = "",
-    platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol', 'cudn-density'.")] = "",
-    scale: Annotated[str, Field(description="Worker node count (ES 'workerNodesCount'). Values: '6', '24', '120', '252'.")] = "",
-    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
     ctx: Context = None,
 ) -> str:
     """Check if an OpenShift version has performance regressions using changepoint detection across all benchmarks. Use when a user asks "has X regressed", "check for regressions", or "any regressions in version X". Input: version like '4.20' or '5.0'.
@@ -1321,15 +1347,15 @@ async def has_openshift_regressed(
 
 @mcp.tool()
 async def has_networking_regressed(
-    version: Annotated[str, Field(description="Version of OpenShift to look into")] = "4.19",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
+    version: VersionParam = "4.19",
+    lookback: LookbackParam = "15",
     configs: Annotated[str, Field(description="Comma-separated list of config files to check (optional, auto-discovered if empty)")] = "",
-    platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol'.")] = "",
-    scale: Annotated[str, Field(description="Worker node count (ES 'workerNodesCount'). Values: '6', '24', '120', '252'.")] = "",
-    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
     ctx: Context = None,
 ) -> str:
     """Check if networking benchmarks (node-density-cni, udn-*) have regressed for an OpenShift version. Use when a user specifically asks about networking, CNI, or UDN regressions. Input: version like '4.20'.
@@ -1371,16 +1397,17 @@ async def metrics_correlation(
     metric1: Annotated[str, Field(description="First metric to analyze")] = "podReadyLatency_P99",
     metric2: Annotated[str, Field(description="Second metric to analyze")] = "ovnCPU_avg",
     *,
-    config_name: Annotated[
-        str | None,
-        Field(
-            description="Orion configuration file name (e.g. 'cluster-density.yaml')"
-        ),
-    ] = None,
+    config_name: ConfigParam = None,
     since: Annotated[str, Field(description="Date to begin looking back for performance data")] = None,
-    version: Annotated[str, Field(description="Version of OpenShift to look into")] = "4.19",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
-    input_vars: Annotated[str, Field(description="JSON string of template variables for the config (e.g. platform, workerNodesCount)")] = "",
+    version: VersionParam = "4.19",
+    lookback: LookbackParam = "15",
+    input_vars: InputVarsParam = "",
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
     ctx: Context = None,
 ) -> types.ImageContent | types.TextContent:
     """Check if two metrics are correlated by computing Pearson coefficient and plotting a scatter chart. Use when a user asks "are these metrics related", "correlate X with Y", or "is ovnCPU correlated with podReadyLatency". Input: two metric names.
@@ -1396,11 +1423,21 @@ async def metrics_correlation(
         version: OpenShift version (default: '4.19').
         lookback: Days to look back (default: '15').
         input_vars: JSON template variables (default: empty, auto-discovered from ES).
+        platform: Cloud platform filter (default: '' = AWS).
+        workload: Job name substring filter (default: '').
+        scale: Worker node count filter (default: '').
+        fips: FIPS filter (default: false).
+        ipsec: IPsec filter (default: false).
+        encrypted: Etcd encryption filter (default: false).
 
     Returns:
         ImageContent (scatter-plot PNG) or TextContent (error).
     """
-    config_value, iv, _ = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
+    config_value, iv, _ = await _resolve_config_and_vars(
+        ctx, config_name, version, input_vars,
+        platform=platform, workload=workload, scale=scale,
+        fips=fips, ipsec=ipsec, encrypted=encrypted,
+    )
 
     result = await run_orion(
         config=ORION_CONFIGS_PATH + config_value,
@@ -1436,14 +1473,14 @@ async def metrics_correlation(
 async def has_nightly_regressed(
     nightly_version: Annotated[str, Field(description="Full nightly version string (e.g., '4.22.0-0.nightly-2026-01-05-203335')")],
     previous_nightly: Annotated[str, Field(description="Optional previous nightly to compare against (e.g., '4.22.0-0.nightly-2026-01-01-123456')")] = "",
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
+    lookback: LookbackParam = "15",
     configs: Annotated[str, Field(description="Comma-separated list of config files (optional, auto-discovered if empty)")] = "",
-    platform: Annotated[str, Field(description="Cloud platform (ES 'platform'/'clusterType'). Values: 'aws', 'rosa-hcp', 'gcp', 'metal'. Defaults to 'aws'.")] = "",
-    workload: Annotated[str, Field(description="Workload filter — matched as substring in job name. E.g. 'data-path', 'netpol'.")] = "",
-    scale: Annotated[str, Field(description="Worker node count (ES 'workerNodesCount'). Values: '6', '24', '120', '252'.")] = "",
-    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
     ctx: Context = None,
 ) -> str:
     """Check if a specific nightly build has regressions by running changepoint detection scoped to that build's time window. Use when a user provides a full nightly version string and asks "inspect this nightly", "has this nightly regressed", or "check nightly X". Input: full nightly string like '5.0.0-0.nightly-2026-08-10-122052'.
@@ -1573,40 +1610,15 @@ def _timestamp_after(timestamp_val, cutoff_datetime: datetime) -> bool:
 
 @mcp.tool()
 async def get_performance_summary(
-    version: Annotated[str, Field(description="OpenShift version to analyze (e.g. '4.18', '4.19', '4.20', '4.21', '4.22', '5.0')")] = "4.19",
+    version: VersionParam = "4.19",
     lookback: Annotated[int, Field(description="Number of days to look back for data")] = 14,
-    platform: Annotated[str, Field(
-        description=(
-            "Cloud platform (ES 'platform'/'clusterType'). Values: 'aws' (default), "
-            "'rosa-hcp', 'rosa', 'gcp', 'azure', 'metal'. "
-            "When specified, returns jobs for that platform (no payload restriction). "
-            "When omitted, defaults to AWS 6-node payload jobs."
-        ),
-    )] = "",
-    workload: Annotated[str, Field(
-        description=(
-            "Workload filter — matched as substring in job name. Common values: "
-            "'control-plane', 'data-path', 'node-density-heavy', 'netpol', 'udn-density-l3'. "
-            "When omitted and no modifier set, defaults to 6-node payload jobs."
-        ),
-    )] = "",
-    scale: Annotated[str, Field(
-        description=(
-            "Worker node count (ES 'workerNodesCount'). Values: '3', '6' (payload), '9', "
-            "'24', '120', '249', '252'."
-        ),
-    )] = "",
-    fips: Annotated[bool, Field(description="Filter on ES 'fips' field.")] = False,
-    ipsec: Annotated[bool, Field(description="Filter on ES 'ipsec' field.")] = False,
-    encrypted: Annotated[bool, Field(description="Filter on ES 'encrypted' field.")] = False,
-    config_name: Annotated[str | None, Field(
-        description=(
-            "Specific config file name to analyze (e.g. 'cluster-density.yaml', "
-            "'small-rosa-hcp-cluster-density.yaml', 'node-density.yaml'). "
-            "If given, only this config is analyzed. The correct config variant is auto-selected "
-            "based on job type when not specified."
-        ),
-    )] = None,
+    platform: PlatformParam = "",
+    workload: WorkloadParam = "",
+    scale: ScaleParam = "",
+    fips: FipsParam = False,
+    ipsec: IpsecParam = False,
+    encrypted: EncryptedParam = False,
+    config_name: ConfigParam = None,
     ctx: Context = None,
 ) -> dict:
     """Broad health check for a version — aggregated stats (min, max, avg, change%) across ALL metrics and ALL benchmarks. Only for broad questions like "how is 4.22 doing" — NOT for named metrics like podReadyLatency or ovnCPU.
