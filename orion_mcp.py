@@ -100,7 +100,7 @@ def _split_configs(config_name: str | None) -> list[str]:
 async def _resolve_config_and_vars(
     ctx,
     config_name: str | None,
-    version: str,
+    _version: str,
     input_vars: str = "",
 ) -> tuple[str, dict | None, dict]:
     """Common setup for tools: extract ES config, parse config name and input_vars.
