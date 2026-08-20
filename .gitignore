@@ -194,4 +194,4 @@ cython_debug/
 .cursorindexingignore
 
 # Local startup scripts with credentials
-start_server.sh
+start_server.sh.DS_Store

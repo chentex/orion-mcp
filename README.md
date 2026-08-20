@@ -64,80 +64,30 @@ python orion_mcp.py  # listens on 0.0.0.0:3030 by default
 
 ## Available Tools
 
-| Tool | Description | Default Arguments |
-|------|-------------|-------------------|
-| `get_data_source` | Returns the configured OpenSearch URL | _none_ |
-| `get_orion_configs` | Lists available Orion configuration files | _none_ |
-| `get_orion_metrics` | Lists metrics grouped by Orion config | `config_name="small-scale-udn-l3.yaml"`, `version="4.20"` |
-| `get_orion_metrics_with_meta` | Lists metrics plus metadata for Orion config | `config_name="small-scale-udn-l3.yaml"`, `version="4.19"` |
-| `get_orion_performance_data` | Returns raw performance values for config/metric/version | `config_name="small-scale-udn-l3.yaml"`, `metric="podReadyLatency_P99"`, `version="4.19"`, `lookback="15"` |
-| `openshift_report_on` | Generates a trend line for one or more OCP versions | `versions="4.19"`, `lookback="15"`, `metric="podReadyLatency_P99"`, `config_name="small-scale-udn-l3.yaml"` |
-| `openshift_report_on_pr` | **NEW** Analyzes performance impact of a specific Pull Request | `version="4.20"`, `lookback="15"`, `organization="openshift"`, `repository="ovn-kubernetes"`, `pull_request="2841"` |
-| `has_openshift_regressed` | Scans all configs for changepoints | `version="4.19"`, `lookback="15"` |
-| `metrics_correlation` | Correlates two metrics & returns a scatter plot | `metric1="podReadyLatency_P99"`, `metric2="ovnCPU_avg"`, `config_name="trt-external-payload-cluster-density.yaml"`, `version="4.19"`, `lookback="15"` |
+### Discovery
+| Tool | Description |
+|------|-------------|
+| `discover_jobs` | Find CI perf jobs by version/platform/workload/scale with pre-resolved Orion configs |
+| `get_orion_configs` | List available Orion configuration files |
+| `get_orion_metrics` | List metrics for a config |
+| `get_release_date` | Get GA release date for a version |
 
----
+### Regression Detection
+| Tool | Description |
+|------|-------------|
+| `has_openshift_regressed` | Changepoint detection across one or more configs (comma-separated) |
+| `has_networking_regressed` | Same as above, scoped to networking configs |
+| `has_nightly_regressed` | Check a specific nightly build for regressions |
 
-## Pull Request Performance Analysis
+### Analysis
+| Tool | Description |
+|------|-------------|
+| `openshift_report_on` | Per-run metric values across one or more versions |
+| `get_performance_summary` | Health check — aggregated stats (min/max/avg/change%) across all metrics, supports comma-separated configs |
+| `metrics_correlation` | Correlate two metrics with scatter plot |
+| `openshift_report_on_pr` | Compare PR performance against periodic baseline |
 
-### Overview
-
-The `openshift_report_on_pr` tool provides **automated performance regression detection** for GitHub Pull Requests. This feature compares the performance metrics of a specific PR against the periodic baseline performance to identify potential regressions.
-
-### How It Works
-
-1. **Baseline Collection**: Gathers periodic performance data for the specified OpenShift version over the lookback period
-2. **PR Analysis**: Runs performance tests specifically for the target Pull Request
-3. **Comparison**: Compares PR performance against the periodic baseline using a **10% threshold**
-4. **Multi-Config Testing**: Tests across multiple Orion configurations for comprehensive coverage
-
-### Supported Configurations
-
-The PR analysis runs against these key performance test configurations:
-
-- `trt-external-payload-cluster-density.yaml` - Cluster density and pod scaling tests
-- `trt-external-payload-node-density.yaml` - Node-level performance and resource utilization
-- `trt-external-payload-node-density-cni.yaml` - CNI-specific networking performance
-- `trt-external-payload-crd-scale.yaml` - Custom Resource Definition scaling tests
-
-### Interpreting Results
-
-- **periodic_avg**: Baseline performance metrics averaged over the lookback period
-- **pull**: Performance metrics from the specific PR's test runs
-- **Regression Detection**: Compare values using the 10% threshold:
-  - `(pull_value - periodic_avg) / periodic_avg > 0.10` indicates a potential regression
-  - Values within ±10% are considered normal variance
-
-### Integration with AI/LLM
-
-The response format is optimized for AI analysis. The LLM can:
-
-1. **Automatically detect regressions** by comparing periodic_avg vs pull metrics
-2. **Apply the 10% threshold** to determine significance
-3. **Generate human-readable reports** highlighting concerning changes
-4. **Provide actionable insights** about which metrics regressed and by how much
-
-### Documentation
-
-For comprehensive documentation:
-
-- **[📚 Complete Documentation](docs/README.md)** - Full documentation index
-- **[🚀 Quick Start Guide](docs/quickstart.md)** - Get started in minutes
-- **[🎯 Features Guide](docs/features/README.md)** - Complete features documentation including PR analysis
-- **[🔧 API Reference](docs/api/README.md)** - Complete API documentation
-
-### Example AI Analysis Prompt
-
-```
-Analyze this PR performance data and identify any regressions using a 10% threshold:
-[paste the JSON response]
-
-For each metric that shows >10% degradation, explain:
-1. The metric name and what it measures
-2. The baseline vs PR values  
-3. The percentage change
-4. Potential impact on users
-```
+All tools take explicit `config_name` and `input_vars`. Use `discover_jobs` to resolve these from ES metadata.
 
 ---
 
