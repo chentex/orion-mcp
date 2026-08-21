@@ -69,7 +69,8 @@ python orion_mcp.py  # listens on 0.0.0.0:3030 by default
 |------|-------------|
 | `discover_jobs` | Find CI perf jobs by version/platform/workload/scale with pre-resolved Orion configs |
 | `get_orion_configs` | List available Orion configuration files |
-| `get_orion_metrics` | List metrics for a config |
+| `get_orion_metrics` | List metric names for a config (live ES query) |
+| `get_orion_metrics_with_meta` | List metrics with direction, threshold, and labels from config YAML |
 | `get_release_date` | Get GA release date for a version |
 
 ### Regression Detection

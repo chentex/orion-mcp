@@ -53,10 +53,14 @@ mcp = FastMCP(name="orion-mcp",
               port=3030,
               log_level='INFO')
 
-ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/orion/examples/")
+ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/Users/balatripurakumaribodapati/Desktop/orion-ai/orion/examples/")
 ORION_CONFIGS = list_orion_configs()
 
-FULL_ORION_CONFIG_PATHS = [os.path.join(ORION_CONFIGS_PATH, config) for config in ORION_CONFIGS]
+# TLS verification — disable only for private CAs (set ORION_VERIFY_TLS=false)
+_VERIFY_TLS = os.getenv("ORION_VERIFY_TLS", "true").lower() != "false"
+
+# Semaphore to cap concurrent prow/gcsweb requests per discover_jobs call
+_PROW_SEMAPHORE = asyncio.Semaphore(15)
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +94,21 @@ def _parse_input_vars(input_vars: str) -> dict | None:
 DEFAULT_CONFIG = "cluster-density.yaml"
 
 
-def _split_configs(config_name: str | None) -> list[str]:
-    """Split a comma-separated config_name into a list. Returns [DEFAULT_CONFIG] if empty."""
+def _split_configs(config_name: str | None, default: list[str] | None = None) -> list[str]:
+    """Split a comma-separated config_name into a list. Returns default (or [DEFAULT_CONFIG]) if empty."""
     if not config_name:
-        return [DEFAULT_CONFIG]
+        return default if default is not None else [DEFAULT_CONFIG]
     return [c.strip() for c in config_name.split(",") if c.strip()]
+
+
+def _config_path(config_name: str) -> str:
+    """Return the full filesystem path for an Orion config filename."""
+    return os.path.join(ORION_CONFIGS_PATH, config_name)
+
+
+def _orion_error_snippet(result) -> str:
+    """Extract a short error message from an Orion subprocess result."""
+    return _orion_error_snippet(result)
 
 
 async def _resolve_config_and_vars(
@@ -102,20 +116,15 @@ async def _resolve_config_and_vars(
     config_name: str | None,
     _version: str,
     input_vars: str = "",
-) -> tuple[str, dict | None, dict]:
+) -> tuple[str, dict | None]:
     """Common setup for tools: extract ES config, parse config name and input_vars.
 
-    Returns (config_value, iv, search_info).
+    Returns (config_value, iv).
     """
     _extract_and_set_es_server(ctx)
     config_value = config_name or DEFAULT_CONFIG
-    search_info = {}
-    try:
-        iv = _parse_input_vars(input_vars)
-    except ValueError as exc:
-        search_info["input_vars_error"] = str(exc)
-        iv = None
-    return config_value, iv, search_info
+    iv = _parse_input_vars(input_vars) if input_vars else None
+    return config_value, iv
 
 
 def _extract_and_set_es_server(ctx) -> None:
@@ -196,9 +205,6 @@ def get_orion_configs() -> list[str]:
     return orion_configs(ORION_CONFIGS)
 
 
-_discover_jobs_cache: dict = {}
-_CACHE_TTL_SECONDS = 86400  # 24 hours
-
 _GCSWEB_BASE = "https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs"
 _PROW_VIEW_PREFIX = "https://prow.ci.openshift.org/view/gs/"
 
@@ -206,8 +212,10 @@ _PROW_VIEW_PREFIX = "https://prow.ci.openshift.org/view/gs/"
 async def _resolve_configs_from_prow(build_url: str) -> list[str]:
     """Resolve Orion config filenames from prow build-log artifacts.
 
-    Deterministic: HTTP GET artifact listings + grep ORION_CONFIG= from build logs.
-    Generic for any workload — new jobs work automatically if they log ORION_CONFIG.
+    Walks: prow build URL → GCS artifacts dir → openshift-qe-orion-* step dirs →
+    each step's build-log.txt → greps for 'ORION_CONFIG=examples/<name>.yaml'.
+    Works for any workload automatically as long as the prow step logs ORION_CONFIG.
+    Returns empty list if build URL is missing, expired, or contains no orion steps.
     """
     if not build_url or _PROW_VIEW_PREFIX not in build_url:
         return []
@@ -217,7 +225,7 @@ async def _resolve_configs_from_prow(build_url: str) -> list[str]:
 
     configs = set()
     try:
-        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15, verify=_VERIFY_TLS, follow_redirects=True) as client:
             resp = await client.get(f"{gcs_base}/artifacts/")
             if resp.status_code != 200:
                 return []
@@ -237,16 +245,17 @@ async def _resolve_configs_from_prow(build_url: str) -> list[str]:
                 return []
 
             async def _fetch_config(step_dir: str) -> str | None:
-                try:
-                    r = await client.get(
-                        f"{gcs_base}/artifacts/{test_name}/{step_dir}/build-log.txt"
-                    )
-                    if r.status_code != 200:
+                async with _PROW_SEMAPHORE:
+                    try:
+                        r = await client.get(
+                            f"{gcs_base}/artifacts/{test_name}/{step_dir}/build-log.txt"
+                        )
+                        if r.status_code != 200:
+                            return None
+                        m = re.search(r'ORION_CONFIG=examples/(\S+\.yaml)', r.text)
+                        return m.group(1) if m else None
+                    except Exception:
                         return None
-                    m = re.search(r'ORION_CONFIG=examples/(\S+\.yaml)', r.text)
-                    return m.group(1) if m else None
-                except Exception:
-                    return None
 
             results = await asyncio.gather(*[_fetch_config(d) for d in orion_dirs])
             configs = {r for r in results if r}
@@ -266,12 +275,13 @@ async def discover_jobs(
     fips: Annotated[str | None, Field(description="FIPS filter ('true' or 'false')")] = None,
     ipsec: Annotated[str | None, Field(description="IPsec filter ('true' or 'false')")] = None,
     encrypted: Annotated[str | None, Field(description="Encryption filter ('true' or 'false')")] = None,
+    job_type: Annotated[str, Field(description="Job type filter: 'periodic' (default, scheduled nightly runs) or 'pull' (PR CI runs). Use 'pull' to discover PR-specific jobs and their configs.")] = "periodic",
     ctx: Context = None,
 ) -> dict:
     """Discover CI jobs, benchmarks, config files, and cluster metadata from Elasticsearch and prow artifacts.
 
     Returns job names, benchmarks, resolved Orion config filenames, cluster metadata, and build URLs.
-    Config files are resolved automatically from prow build logs (deterministic, cached 24h).
+    Config files are resolved automatically from prow build logs.
 
     Args:
         version: OCP version prefix filter (e.g. '4.22'). Empty string returns all versions.
@@ -282,23 +292,18 @@ async def discover_jobs(
         fips: FIPS filter ('true' or 'false').
         ipsec: IPsec filter ('true' or 'false').
         encrypted: Encryption filter ('true' or 'false').
+        job_type: 'periodic' (default) for scheduled nightly runs, 'pull' for PR CI runs.
+            Use 'pull' when analyzing PRs to discover PR-specific configs not in periodic jobs.
 
     Returns:
         Dict with 'jobs' mapping job names to benchmarks, configs (list of config filenames), metadata, buildUrl.
     """
     _extract_and_set_es_server(ctx)
 
-    cache_key = f"{version}|{platform}|{cluster_type}|{workload}|{scale}|{fips}|{ipsec}|{encrypted}"
-    now = datetime.now().timestamp()
-    if cache_key in _discover_jobs_cache:
-        cached_time, cached_result = _discover_jobs_cache[cache_key]
-        if now - cached_time < _CACHE_TTL_SECONDS:
-            return cached_result
-
     es_server = get_data_source()
     es_index = get_es_metadata_index()
 
-    must_clauses = [{"term": {"jobType": "periodic"}}]
+    must_clauses = [{"term": {"jobType": job_type}}]
     if version:
         must_clauses.append({"prefix": {"ocpVersion.keyword": version}})
     if platform:
@@ -324,7 +329,7 @@ async def discover_jobs(
                     "benchmarks": {"terms": {"field": "benchmark.keyword", "size": 10}},
                     "top_hit": {
                         "top_hits": {
-                            "size": 1,
+                            "size": 3,
                             "sort": [{"timestamp": {"order": "desc"}}],
                             "_source": [
                                 "platform", "clusterType", "workerNodesCount",
@@ -345,7 +350,7 @@ async def discover_jobs(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=30, verify=False) as client:
+        async with httpx.AsyncClient(timeout=30, verify=_VERIFY_TLS) as client:
             resp = await client.post(
                 f"{es_server}/{es_index}/_search",
                 json=query,
@@ -360,8 +365,10 @@ async def discover_jobs(
     for bucket in data.get("aggregations", {}).get("jobs", {}).get("buckets", []):
         job_name = bucket["key"]
         benchmarks = [b["key"] for b in bucket.get("benchmarks", {}).get("buckets", [])]
-        hit = bucket.get("top_hit", {}).get("hits", {}).get("hits", [])
-        metadata = hit[0]["_source"] if hit else {}
+        hits = bucket.get("top_hit", {}).get("hits", {}).get("hits", [])
+        # Use latest run for metadata, collect up to 3 buildUrls for config resolution
+        metadata = hits[0]["_source"] if hits else {}
+        build_urls = [h["_source"].get("buildUrl", "") for h in hits if h["_source"].get("buildUrl")]
 
         jobs[job_name] = {
             "benchmarks": benchmarks,
@@ -378,17 +385,22 @@ async def discover_jobs(
                 "workerNodesType": metadata.get("workerNodesType", ""),
             },
             "buildUrl": metadata.get("buildUrl", ""),
+            "_build_urls": build_urls,
         }
 
-    # Resolve config files from prow build logs (concurrent, all jobs at once)
+    # Resolve config files from prow build logs — try up to 3 recent runs per job
+    # so a failed latest run doesn't leave configs empty.
     async def _resolve_for_job(job_data):
-        job_data["configs"] = await _resolve_configs_from_prow(job_data.get("buildUrl", ""))
+        for url in job_data.pop("_build_urls", []):
+            configs = await _resolve_configs_from_prow(url)
+            if configs:
+                job_data["configs"] = configs
+                return
+        job_data["configs"] = []
 
     await asyncio.gather(*[_resolve_for_job(d) for d in jobs.values()])
 
-    result = {"jobs": jobs, "total": len(jobs)}
-    _discover_jobs_cache[cache_key] = (now, result)
-    return result
+    return {"jobs": jobs, "total": len(jobs)}
 
 
 @mcp.tool()
@@ -411,15 +423,13 @@ async def get_orion_metrics(
     Returns:
         Dict keyed by config with list of metric names.
     """
-    effective_config, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
+    effective_config, iv = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
 
-    result = await orion_metrics([ORION_CONFIGS_PATH + effective_config], version=version, input_vars=iv)
+    result = await orion_metrics([_config_path(effective_config)], version=version, input_vars=iv)
 
     if isinstance(result, str):
         return {"error": f"Failed to fetch Orion metrics: {result}"}
 
-    if search_info:
-        result["search"] = search_info
     return result
 
 
@@ -443,27 +453,21 @@ async def get_orion_metrics_with_meta(
     Returns:
         Dict with "metrics" (list of names) and "meta" (per-metric label, direction, threshold).
     """
-    effective_config, iv, search_info = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
+    effective_config, iv = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
     try:
         metrics, meta_map = _load_config_metrics_with_meta(
-            os.path.join(ORION_CONFIGS_PATH, effective_config),
+            _config_path(effective_config),
             version=version,
             input_vars=iv,
         )
-        resp = {"metrics": metrics, "meta": meta_map}
-        if search_info:
-            resp["search"] = search_info
-        return resp
+        return {"metrics": metrics, "meta": meta_map}
     except Exception as e:
         result = await orion_metrics(
-            [ORION_CONFIGS_PATH + effective_config], version=version, input_vars=iv,
+            [_config_path(effective_config)], version=version, input_vars=iv,
         )
         if isinstance(result, str):
             return {"error": f"{e} | {result}"}
-        resp = {"metrics": result, "meta": {}, "warning": str(e)}
-        if search_info:
-            resp["search"] = search_info
-        return resp
+        return {"metrics": result, "meta": {}, "warning": str(e)}
 
 
 @mcp.tool()
@@ -503,7 +507,7 @@ async def openshift_report_on(
     if not version_list:
         return {"error": "No valid versions provided"}
 
-    config_value, iv, search_info = await _resolve_config_and_vars(
+    config_value, iv = await _resolve_config_and_vars(
         ctx, config_name, version_list[0], input_vars,
     )
 
@@ -512,14 +516,12 @@ async def openshift_report_on(
         "metric": metric,
         "versions": {},
     }
-    if search_info:
-        output["search"] = search_info
 
     errors = []
     for ver in version_list:
         ver_iv = dict(iv, version=ver) if iv else None
         result = await run_orion(
-            config=ORION_CONFIGS_PATH + config_value,
+            config=_config_path(config_value),
             version=ver,
             lookback=lookback,
             since=since,
@@ -532,25 +534,19 @@ async def openshift_report_on(
             errors.append(f"No data for version {ver}: {sum_result}")
             continue
 
-        raw_values = sum_result[metric].get("value", [])
-        if not isinstance(raw_values, list):
-            errors.append(f"Unexpected data format for version {ver}")
-            continue
-
         raw_runs = sum_result.get("runs", [])
         values = []
         runs_context = []
-        for i, v in enumerate(raw_values):
+        for run in raw_runs:
+            v = run.get("metrics", {}).get(metric, {}).get("value")
             if v is None:
                 continue
             values.append(v)
-            if i < len(raw_runs):
-                run = raw_runs[i]
-                runs_context.append({
-                    "timestamp": run.get("timestamp"),
-                    "ocpVersion": run.get("ocpVersion"),
-                    "buildUrl": run.get("buildUrl"),
-                })
+            runs_context.append({
+                "timestamp": run.get("timestamp"),
+                "ocpVersion": run.get("ocpVersion"),
+                "buildUrl": run.get("buildUrl"),
+            })
 
         if not values:
             errors.append(f"All values are None for version {ver}")
@@ -567,7 +563,11 @@ async def openshift_report_on(
 
 
 def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
-    """Calculate and set percentage_change on each metric in pull data."""
+    """Mutate pull run metric entries to add percentage_change vs periodic baseline.
+
+    periodic_avg: {metric_name: {"value": float} | float} — average from periodic runs.
+    Sets metric_data["percentage_change"] = None when either value is missing or baseline is zero.
+    """
     for pull_obj in pulls_list:
         for pull_entry in pull_obj.get("data", []):
             for metric_name, metric_data in pull_entry.get("metrics", {}).items():
@@ -592,6 +592,12 @@ def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
 
 
 def _flatten_pr_summary(summaries: list[dict]) -> list[dict]:
+    """Convert raw orion PR result list into a flat per-config structure.
+
+    Input: list of per-config dicts with 'periodic_avg' and 'pulls' from run_orion PR mode.
+    Output: list of {config, runs: [{pull_number, metrics: [{name, baseline, pr_value, change_pct}]}]}.
+    Error entries pass through as {config, error}.
+    """
     results = []
     for summary in summaries:
         config_name = os.path.basename(summary.get("config", "unknown"))
@@ -674,7 +680,7 @@ async def openshift_report_on_pr(
         repository: GitHub repository (default: 'ovn-kubernetes').
         pull_request: Single PR number (default: '2841').
         pull_requests: Comma-separated PR numbers for multi-PR comparison (default: empty).
-        config_name: Orion config filename (e.g. 'cluster-density.yaml').
+        config_name: Orion config filename or comma-separated list (e.g. 'cluster-density.yaml,node-density.yaml').
         input_vars: JSON string of template variables for the config.
 
     Returns:
@@ -686,8 +692,8 @@ async def openshift_report_on_pr(
     _extract_and_set_es_server(ctx)
     try:
         iv = _parse_input_vars(input_vars)
-    except ValueError:
-        iv = None
+    except ValueError as exc:
+        return [{"config": config_name or DEFAULT_CONFIG, "error": str(exc)}]
     configs = _split_configs(config_name)
 
     if pull_requests and pull_requests.strip():
@@ -708,7 +714,7 @@ async def openshift_report_on_pr(
 
     summaries: list[dict] = []
     for config_value in configs:
-        full_config_path = os.path.join(ORION_CONFIGS_PATH, config_value)
+        full_config_path = _config_path(config_value)
         result = await run_orion(
             config=full_config_path,
             version=version,
@@ -721,7 +727,7 @@ async def openshift_report_on_pr(
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError:
-            stderr_snippet = (result.stderr or result.stdout or "")[:200].strip()
+            stderr_snippet = _orion_error_snippet(result)
             summaries.append({"config": full_config_path, "error": f"Orion failed (exit {result.returncode}): {stderr_snippet}"})
             continue
 
@@ -799,7 +805,7 @@ async def _run_regression_checks(
     Execute Orion across the provided configs and return a formatted summary of
     detected changepoints, or "No changepoints found" if none are detected.
     """
-    full_config_paths = [os.path.join(ORION_CONFIGS_PATH, config) for config in configs]
+    full_config_paths = [_config_path(config) for config in configs]
     changepoints: list[str] = []
 
     for full_config_path in full_config_paths:
@@ -819,7 +825,7 @@ async def _run_regression_checks(
         try:
             details = _extract_regression_details(result.stdout)
         except (json.JSONDecodeError, TypeError):
-            stderr_snippet = (result.stderr or result.stdout or "")[:200].strip()
+            stderr_snippet = _orion_error_snippet(result)
             changepoints.append(f"❌ Error: Orion failed for {config_short} (exit {result.returncode}): {stderr_snippet}")
             continue
 
@@ -879,10 +885,18 @@ async def has_openshift_regressed(
     _extract_and_set_es_server(ctx)
     try:
         iv = _parse_input_vars(input_vars)
-    except ValueError:
-        iv = None
+    except ValueError as exc:
+        return f"Error: {exc}"
     configs = _split_configs(config_name)
     return await _run_regression_checks(configs, version=version, lookback=lookback, input_vars=iv)
+
+
+# Networking configs are run inside payload jobs (no separate networking job).
+# These two cover CNI and UDN workloads and survive after orion/pull/423 cleanup.
+_DEFAULT_NETWORKING_CONFIGS = [
+    "node-density-cni.yaml",
+    "udn-density-pods.yaml",
+]
 
 
 @mcp.tool()
@@ -912,9 +926,9 @@ async def has_networking_regressed(
     _extract_and_set_es_server(ctx)
     try:
         iv = _parse_input_vars(input_vars)
-    except ValueError:
-        iv = None
-    configs = _split_configs(config_name)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    configs = _split_configs(config_name, default=_DEFAULT_NETWORKING_CONFIGS)
     return await _run_regression_checks(configs, version=version, lookback=lookback, input_vars=iv)
 
 # Correlation tool
@@ -948,12 +962,12 @@ async def metrics_correlation(
     Returns:
         ImageContent (scatter-plot PNG) or TextContent (error).
     """
-    config_value, iv, _ = await _resolve_config_and_vars(
+    config_value, iv = await _resolve_config_and_vars(
         ctx, config_name, version, input_vars,
     )
 
     result = await run_orion(
-        config=ORION_CONFIGS_PATH + config_value,
+        config=_config_path(config_value),
         version=version,
         lookback=lookback,
         since=since,
@@ -1000,7 +1014,7 @@ async def has_nightly_regressed(
         nightly_version: Full nightly string (required, e.g. '4.22.0-0.nightly-2026-01-05-203335').
         previous_nightly: Earlier nightly to scope the comparison window (default: empty).
         lookback: Days to look back (default: '15').
-        config_name: Orion config filename (e.g. 'cluster-density.yaml').
+        config_name: Orion config filename or comma-separated list (e.g. 'cluster-density.yaml,node-density.yaml').
         input_vars: JSON string of template variables for the config.
 
     Returns:
@@ -1030,13 +1044,13 @@ async def has_nightly_regressed(
 
     try:
         iv = _parse_input_vars(input_vars)
-    except ValueError:
-        iv = None
+    except ValueError as exc:
+        return f"Error: {exc}"
     configs = _split_configs(config_name)
 
     all_regressions: list[str] = []
     for config_value in configs:
-        full_config_path = os.path.join(ORION_CONFIGS_PATH, config_value)
+        full_config_path = _config_path(config_value)
 
         result = await run_orion(
             config=full_config_path,
@@ -1050,7 +1064,7 @@ async def has_nightly_regressed(
         try:
             data = json.loads(result.stdout)
         except (json.JSONDecodeError, TypeError):
-            stderr_snippet = (result.stderr or result.stdout or "")[:200].strip()
+            stderr_snippet = _orion_error_snippet(result)
             all_regressions.append(f"❌ Error: Orion failed for {config_value} (exit {result.returncode}): {stderr_snippet}")
             continue
 
@@ -1097,7 +1111,7 @@ def _timestamp_after(timestamp_val, cutoff_datetime: datetime) -> bool:
 async def _summarize_single_config(
     config_value: str, version: str, lookback: int, iv: dict | None,
 ) -> dict:
-    full_path = os.path.join(ORION_CONFIGS_PATH, config_value)
+    full_path = _config_path(config_value)
 
     try:
         metrics_list, meta_map = _load_config_metrics_with_meta(full_path, version, input_vars=iv)
@@ -1118,6 +1132,9 @@ async def _summarize_single_config(
     if not isinstance(sum_result, dict):
         return {"config": config_value, "success": False, "error": f"Unexpected Orion output: {sum_result}"}
 
+    # Fetch double-lookback window, then select runs whose timestamp falls
+    # strictly before the current-window cutoff to avoid mixing windows.
+    cutoff_ts = datetime.now().timestamp() - lookback * 86400
     prior_sum = {}
     try:
         prior_result = await run_orion(
@@ -1128,9 +1145,18 @@ async def _summarize_single_config(
         )
         prior_sum_raw = await summarize_result(prior_result)
         if isinstance(prior_sum_raw, dict):
-            prior_sum = prior_sum_raw
-    except Exception:
-        pass
+            prior_runs = prior_sum_raw.get("runs", [])
+            for run in prior_runs:
+                run_ts = run.get("timestamp", cutoff_ts)
+                if isinstance(run_ts, (int, float)) and run_ts >= cutoff_ts:
+                    continue
+                for m_name, m_data in run.get("metrics", {}).items():
+                    prior_sum.setdefault(m_name, [])
+                    v = m_data.get("value")
+                    if v is not None:
+                        prior_sum[m_name].append(v)
+    except Exception as exc:
+        logger.debug("Prior-period query failed for %s: %s", config_value, exc)
 
     metric_summaries = []
     for m_name in metrics_list:
@@ -1145,16 +1171,12 @@ async def _summarize_single_config(
         meta = meta_map.get(m_name, {})
 
         change_pct = None
-        two_period_values = prior_sum.get(m_name, {}).get("value", [])
-        two_period_values = [v for v in two_period_values if v is not None]
-        current_count = len(values)
-        if len(two_period_values) > current_count:
-            previous_values = two_period_values[:-current_count]
-            if previous_values:
-                previous_avg = sum(previous_values) / len(previous_values)
-                current_avg = sum(values) / len(values)
-                if previous_avg != 0:
-                    change_pct = round(((current_avg - previous_avg) / abs(previous_avg)) * 100, 2)
+        previous_values = prior_sum.get(m_name, [])
+        if previous_values:
+            previous_avg = sum(previous_values) / len(previous_values)
+            current_avg = avg_val
+            if previous_avg != 0:
+                change_pct = round(((current_avg - previous_avg) / abs(previous_avg)) * 100, 2)
 
         metric_summaries.append({
             "name": m_name,
@@ -1199,11 +1221,11 @@ async def get_performance_summary(
     _extract_and_set_es_server(ctx)
     try:
         iv = _parse_input_vars(input_vars)
-    except ValueError:
-        iv = None
+    except ValueError as exc:
+        return {"success": False, "error": str(exc), "results": []}
     configs = _split_configs(config_name)
     if not configs:
-        config_value, iv, _ = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
+        config_value, iv = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
         configs = [config_value]
 
     results = await asyncio.gather(*[
