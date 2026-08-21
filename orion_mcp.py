@@ -53,7 +53,7 @@ mcp = FastMCP(name="orion-mcp",
               port=3030,
               log_level='INFO')
 
-ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/Users/balatripurakumaribodapati/Desktop/orion-ai/orion/examples/")
+ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/orion/examples/")
 ORION_CONFIGS = list_orion_configs()
 
 # TLS verification — disable only for private CAs (set ORION_VERIFY_TLS=false)
@@ -108,7 +108,7 @@ def _config_path(config_name: str) -> str:
 
 def _orion_error_snippet(result) -> str:
     """Extract a short error message from an Orion subprocess result."""
-    return _orion_error_snippet(result)
+    return (result.stderr or result.stdout or "")[:200].strip()
 
 
 async def _resolve_config_and_vars(
