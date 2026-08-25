@@ -16,7 +16,7 @@ import shutil
 import subprocess
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -573,13 +573,13 @@ def parse_timestamp(timestamp_val) -> Optional[datetime]:
     """
     try:
         if isinstance(timestamp_val, (int, float)):
-            return datetime.fromtimestamp(timestamp_val)
+            return datetime.fromtimestamp(timestamp_val, tz=timezone.utc)
         if isinstance(timestamp_val, str):
             try:
-                return datetime.fromtimestamp(float(timestamp_val))
+                return datetime.fromtimestamp(float(timestamp_val), tz=timezone.utc)
             except ValueError:
                 ts_clean = timestamp_val.replace("Z", "").split("+")[0].split(".")[0]
-                return datetime.fromisoformat(ts_clean)
+                return datetime.fromisoformat(ts_clean).replace(tzinfo=timezone.utc)
     except (ValueError, TypeError, OSError):
         pass
     return None

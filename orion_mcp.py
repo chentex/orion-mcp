@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from pydantic import Field
 import jinja2
@@ -795,9 +795,9 @@ async def openshift_report_on_pr(
     else:
         pr_list = [pull_request]
 
-    configs = _split_configs(config_name)
-    if not configs:
+    if not config_name:
         return {"summaries": [], "error": "config_name is required — call discover_jobs with job_type='pull' first to resolve PR configs"}
+    configs = _split_configs(config_name)
 
     try:
         summaries = await get_pr_details(organization, repository, pr_list, version, lookback,
@@ -1190,7 +1190,7 @@ async def _summarize_single_config(
         return {"config": config_value, "success": False, "error": f"Unexpected Orion output: {sum_result}"}
 
     # Prior window: double lookback, filter to runs strictly before current window cutoff
-    cutoff_dt = datetime.fromtimestamp(datetime.now().timestamp() - lookback * 86400)
+    cutoff_dt = datetime.now(tz=timezone.utc) - timedelta(days=lookback)
     prior_sum: dict[str, list] = {}
     try:
         prior_result = await run_orion(config=full_path, version=version, lookback=str(lookback * 2), input_vars=iv)
