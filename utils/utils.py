@@ -20,7 +20,6 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -31,6 +30,29 @@ ORION_CONFIGS_PATH = "/orion/examples/"
 # Provides async-safe isolation between concurrent requests
 # Contains: es_server, es_metadata_index (optional), es_benchmark_index (optional)
 current_es_config: ContextVar[Optional[dict]] = ContextVar('current_es_config', default=None)
+
+TEAM_OVERRIDES = {
+    "telco": {
+        "es_env": "TELCO_ES_SERVER",
+        "es_metadata_index": "telco_metadata",
+        "es_benchmark_index": "telco_benchmark",
+    },
+    "quay": {
+        "es_env": "QUAY_ES_SERVER",
+        "es_metadata_index": "quay_metadata",
+        "es_benchmark_index": "quay_benchmark",
+    },
+}
+
+
+def _get_team_override(team: Optional[str], field: str) -> Optional[str]:
+    """Return an override value if the team has one for the given field."""
+    if not team or team.lower() == "ocp":
+        return None
+    overrides = TEAM_OVERRIDES.get(team.lower())
+    if overrides and field in overrides:
+        return overrides[field]
+    return None
 
 def resolve_env_var(primary_name: str, secondary_name: str, default_value: str) -> str:
     """
@@ -125,6 +147,7 @@ async def run_orion(
     pull_numbers: Optional[list[int]] = None,
     jira_ack: bool = False,
     jira_status_filter: Optional[str] = None,
+    team: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """
     Execute Orion to analyze performance data for regressions.
@@ -136,12 +159,12 @@ async def run_orion(
         display: Optional field to display in the output (e.g., "ocpVirtVersion").
         jira_ack: Use JIRA as ACK provider instead of file-based ACKs.
         jira_status_filter: Only treat JIRA issues with this status as ACKs (e.g., "Done").
+        team: Team or context (e.g. 'telco', 'quay'). Determines ES server and indices.
 
     Returns:
         The result of the Orion command execution, including stdout and stderr.
     """
-    # get_data_source() checks context variable first, then environment variable
-    data_source = get_data_source()
+    data_source = get_data_source(team=team)
     if data_source == "":
         raise ValueError("Data source is not set")
 
@@ -187,9 +210,8 @@ async def run_orion(
         for pn in pull_numbers:
             command.extend(["--pull-number", str(pn)])
 
-    # Get indices from context (if present) or environment variables
-    es_metadata_index = get_es_metadata_index()
-    es_benchmark_index = get_es_benchmark_index()
+    es_metadata_index = get_es_metadata_index(team=team)
+    es_benchmark_index = get_es_benchmark_index(team=team)
 
     env = {
         "ES_SERVER": data_source,
@@ -252,24 +274,30 @@ async def summarize_result(result: subprocess.CompletedProcess, isolate: Optiona
     return summary
 
 
-def get_data_source() -> str:
+def get_data_source(team: Optional[str] = None) -> str:
     """
     Provide the data source URL for Orion analysis.
 
     Checks ES_SERVER in this order:
     1. Context variable (from encrypted request header)
-    2. Environment variable (fallback)
+    2. Team override (TEAM_OVERRIDES)
+    3. Environment variable (fallback)
 
     Returns:
         The OpenSearch URL as a string.
     """
-    # Check context variable first (set from encrypted header)
     es_config = current_es_config.get()
     if es_config and "es_server" in es_config:
         print("Using ES_SERVER from encrypted request header")
         return es_config["es_server"]
 
-    # Fall back to environment variable
+    override = _get_team_override(team, "es_env")
+    if override is not None:
+        value = os.environ.get(override)
+        if value:
+            print(f"Using ES_SERVER from team override ({team}): {override}")
+            return value
+
     value = os.environ.get("ES_SERVER")
     if value is None:
         raise EnvironmentError("ES_SERVER environment variable is not set")
@@ -277,68 +305,78 @@ def get_data_source() -> str:
     return value
 
 
-def get_es_metadata_index() -> str:
+def get_es_metadata_index(team: Optional[str] = None) -> str:
     """
-    Get es_metadata_index from context or environment with fallback.
+    Get es_metadata_index from context, team override, or environment.
 
     Checks in this order:
     1. Context variable (from encrypted request header)
-    2. Environment variables (es_metadata_index or ES_METADATA_INDEX)
-    3. Default: "perf_scale_ci*"
+    2. Team override (TEAM_OVERRIDES)
+    3. Environment variables (es_metadata_index or ES_METADATA_INDEX)
+    4. Default: "perf_scale_ci*"
 
     Returns:
         The metadata index pattern as a string.
     """
-    # Check context variable first
     es_config = current_es_config.get()
     if es_config and "es_metadata_index" in es_config:
         print("Using es_metadata_index from encrypted request header")
         return es_config["es_metadata_index"]
 
-    # Fall back to environment variable
+    override = _get_team_override(team, "es_metadata_index")
+    if override is not None:
+        print(f"Using es_metadata_index from team override ({team}): {override}")
+        return override
+
     print("Using es_metadata_index from environment/default")
     return resolve_env_var("es_metadata_index", "ES_METADATA_INDEX", "perf_scale_ci*")
 
 
-def get_es_benchmark_index() -> str:
+def get_es_benchmark_index(team: Optional[str] = None) -> str:
     """
-    Get es_benchmark_index from context or environment with fallback.
+    Get es_benchmark_index from context, team override, or environment.
 
     Checks in this order:
     1. Context variable (from encrypted request header)
-    2. Environment variables (es_benchmark_index or ES_BENCHMARK_INDEX)
-    3. Default: "ripsaw-kube-burner-*"
+    2. Team override (TEAM_OVERRIDES)
+    3. Environment variables (es_benchmark_index or ES_BENCHMARK_INDEX)
+    4. Default: "ripsaw-kube-burner-*"
 
     Returns:
         The benchmark index pattern as a string.
     """
-    # Check context variable first
     es_config = current_es_config.get()
     if es_config and "es_benchmark_index" in es_config:
         print("Using es_benchmark_index from encrypted request header")
         return es_config["es_benchmark_index"]
 
-    # Fall back to environment variable
+    override = _get_team_override(team, "es_benchmark_index")
+    if override is not None:
+        print(f"Using es_benchmark_index from team override ({team}): {override}")
+        return override
+
     print("Using es_benchmark_index from environment/default")
     return resolve_env_var("es_benchmark_index", "ES_BENCHMARK_INDEX", "ripsaw-kube-burner-*")
 
 
-async def orion_metrics(config_list: list, version: str = "4.20") -> dict | str:
+async def orion_metrics(config_list: list, version: str = "4.20", team: Optional[str] = None) -> dict | str:
     """
     Provide the metrics for Orion analysis.
     Args:
         config_list: List of Orion configuration files.
+        team: Team or context (e.g. 'telco', 'quay'). Determines ES server and indices.
     Returns:
         A dictionary containing the metrics for Orion analysis.
         the key is the config the metric is associated with
         the value is a list of all the metric names that are available for that config
     """
-    metrics = {} 
+    metrics = {}
     for config in config_list:
         result = await run_orion(
             config=config,
             version=version,
-            lookback="15"
+            lookback="15",
+            team=team,
         )
         try:
             sum_result = await summarize_result(result)
@@ -387,14 +425,21 @@ GITHUB_CONFIGS_URL = "https://api.github.com/repos/cloud-bulldozer/orion/content
 logger = logging.getLogger(__name__)
 
 
-def list_orion_configs() -> list[str]:
+def list_orion_configs(team: Optional[str] = None) -> list[str]:
     """
     List the Orion configuration files.
 
-    Tries in order:
-    1. GitHub API (cloud-bulldozer/orion examples directory)
-    2. Local /orion/examples/ directory
+    Args:
+        team: Team/context subdirectory (e.g. "telco", "quay").
+              None or "ocp" lists root configs from GitHub API or local fallback.
     """
+    if team and team.lower() != "ocp":
+        config_dir = os.path.join(ORION_CONFIGS_PATH, team.lower())
+        try:
+            return [f for f in os.listdir(config_dir) if f.endswith(('.yaml', '.yml'))]
+        except (FileNotFoundError, OSError):
+            return []
+
     try:
         resp = httpx.get(GITHUB_CONFIGS_URL, timeout=10)
         resp.raise_for_status()

@@ -134,10 +134,20 @@ async def get_release_date(
     return f"Invalid version: {version}"
 
 @mcp.tool()
-def get_orion_configs() -> list[str]:
+def get_orion_configs(
+    team: Annotated[
+        str | None,
+        Field(
+            description="Team or context to list configs for (e.g. 'telco', 'quay'). "
+                        "Omit or use 'ocp' for the default OCP configs."
+        ),
+    ] = None,
+) -> list[str]:
     """
     Return the list of Orion config filenames (not full paths).
     """
+    if team and team.lower() != "ocp":
+        return list_orion_configs(team=team)
     return orion_configs(ORION_CONFIGS)
 
 @mcp.tool()
@@ -149,6 +159,10 @@ async def get_orion_metrics(
         ),
     ] = None,
     version: Annotated[str, Field(description="OpenShift version used to query metrics")] = "4.20",
+    team: Annotated[
+        str | None,
+        Field(description="Team or context (e.g. 'telco', 'quay'). Determines ES server and indices."),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Return the list of metrics available for a specific Orion *config*.
@@ -169,7 +183,7 @@ async def get_orion_metrics(
     effective_config = config_name or default_config
 
     # Query only the requested config
-    result = await orion_metrics([ORION_CONFIGS_PATH + effective_config], version=version)
+    result = await orion_metrics([ORION_CONFIGS_PATH + effective_config], version=version, team=team)
 
     if isinstance(result, str):
         return {"error": f"Failed to fetch Orion metrics: {result}"}
@@ -186,6 +200,10 @@ async def get_orion_metrics_with_meta(
         ),
     ] = None,
     version: Annotated[str, Field(description="OpenShift version used to render the config template")] = "4.19",
+    team: Annotated[
+        str | None,
+        Field(description="Team or context (e.g. 'telco', 'quay'). Determines ES server and indices."),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Return metrics and metadata for a specific Orion *config*.
@@ -213,7 +231,7 @@ async def get_orion_metrics_with_meta(
         # Fall back to Orion metrics without metadata if parsing fails
         # Preserve the caller's version when we have to fall back to data-driven metric discovery.
         result = await orion_metrics(
-            [ORION_CONFIGS_PATH + effective_config], version=version
+            [ORION_CONFIGS_PATH + effective_config], version=version, team=team
         )
         if isinstance(result, str):
             return {"error": f"{e} | {result}"}
@@ -231,6 +249,10 @@ async def openshift_report_on(
         str | None,
         Field(description="Orion configuration file name (e.g. 'small-scale-udn-l3.yaml')"),
     ] = None,
+    team: Annotated[
+        str | None,
+        Field(description="Team or context (e.g. 'telco', 'quay'). Determines ES server and indices."),
+    ] = None,
     options: Annotated[str, Field(description="Options in format 'output_format' or 'output_format:display_field'. Examples: 'image', 'json', 'both', 'json:ocpVirtVersion'")] = "image",
     ctx: Context = None,
 ) -> types.ImageContent | types.TextContent:
@@ -246,6 +268,7 @@ async def openshift_report_on(
         since: The date to begin looking back for performance data. Defaults to None.
         metric: The metric to analyze. Defaults to podReadyLatency_P99.
         config_name: The config to analyze. Defaults to small-scale-udn-l3.yaml.
+        team: Team or context (e.g. 'telco', 'quay'). Determines ES server and indices.
         options: Output format and optional display field. Format: 'output_format' or
                 'output_format:display_field'. Examples: 'image', 'json:ocpVirtVersion'.
 
@@ -281,6 +304,7 @@ async def openshift_report_on(
             lookback=lookback,
             since=since,
             display=display if display.strip() else None,
+            team=team,
         )
 
         sum_result = await summarize_result(result, isolate=metric)
@@ -359,6 +383,10 @@ async def get_orion_performance_data(
     version: Annotated[str, Field(description="OpenShift version to analyze")] = "4.19",
     lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
     since: Annotated[str | None, Field(description="Date to begin looking back for performance data")] = None,
+    team: Annotated[
+        str | None,
+        Field(description="Team or context (e.g. 'telco', 'quay'). Determines ES server and indices."),
+    ] = None,
     ctx: Context = None,
 ) -> dict:
     """Return performance data values for a specific config/metric/version.
@@ -377,6 +405,7 @@ async def get_orion_performance_data(
             version=version,
             lookback=lookback,
             since=since,
+            team=team,
         )
         sum_result = await summarize_result(result, isolate=metric)
 
@@ -606,6 +635,7 @@ async def _run_regression_checks(
     configs: list[str],
     version: str,
     lookback: str,
+    team: str | None = None,
 ) -> str:
     """
     Execute Orion across the provided configs and return a formatted summary of
@@ -626,6 +656,7 @@ async def _run_regression_checks(
             lookback=lookback,
             jira_ack=True,
             jira_status_filter="Done",
+            team=team,
         )
 
         if result.returncode not in (0, 3):
@@ -730,6 +761,10 @@ async def metrics_correlation(
             description="Orion configuration file name (e.g. 'trt-external-payload-cluster-density.yaml')"
         ),
     ] = None,
+    team: Annotated[
+        str | None,
+        Field(description="Team or context (e.g. 'telco', 'quay'). Determines ES server and indices."),
+    ] = None,
     since: Annotated[str, Field(description="Date to begin looking back for performance data")] = None,
     version: Annotated[str, Field(description="Version of OpenShift to look into")] = "4.19",
     lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
@@ -755,6 +790,7 @@ async def metrics_correlation(
         version=version,
         lookback=lookback,
         since=since,
+        team=team,
     )
 
     summary = await summarize_result(result)
@@ -785,6 +821,10 @@ async def has_nightly_regressed(
     previous_nightly: Annotated[str, Field(description="Optional previous nightly to compare against (e.g., '4.22.0-0.nightly-2026-01-01-123456')")] = "",
     lookback: Annotated[str, Field(description="Number of days to lookback")] = "30",
     configs: Annotated[str, Field(description="Comma-separated list of config files (optional, defaults to TRT configs)")] = "",
+    team: Annotated[
+        str | None,
+        Field(description="Team or context (e.g. 'telco', 'quay'). Determines ES server and indices."),
+    ] = None,
     ctx: Context = None,
 ) -> str:
     """
@@ -849,6 +889,7 @@ async def has_nightly_regressed(
             lookback=lookback,
             jira_ack=True,
             jira_status_filter="Done",
+            team=team,
         )
 
         try:
