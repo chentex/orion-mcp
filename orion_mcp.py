@@ -586,7 +586,7 @@ async def openshift_report_on(
 
     try:
         img_b64 = generate_multi_line_plot(all_series, metric)
-        return types.ImageContent(type="image", data=img_b64.decode("utf-8"), mimeType="image/jpeg")
+        return types.ImageContent(type="image", data=img_b64.decode("utf-8"), mimeType="image/png")
     except ValueError as e:
         return types.TextContent(type="text", text=str(e))
 
@@ -1053,7 +1053,7 @@ async def metrics_correlation(
     # Compute correlation & generate plot
     corr_b64 = generate_correlation_plot(values1, values2, metric1, metric2, title_prefix=f"{config_value}: ")
 
-    return types.ImageContent(type="image", data=corr_b64.decode("utf-8"), mimeType="image/jpeg")
+    return types.ImageContent(type="image", data=corr_b64.decode("utf-8"), mimeType="image/png")
 
 
 @mcp.tool()
@@ -1189,15 +1189,15 @@ async def _summarize_single_config(
         return {"config": config_value, "success": False, "error": f"Unexpected Orion output: {sum_result}"}
 
     # Prior window: double lookback, filter to runs strictly before current window cutoff
-    cutoff_ts = datetime.now().timestamp() - lookback * 86400
+    cutoff_dt = datetime.fromtimestamp(datetime.now().timestamp() - lookback * 86400)
     prior_sum: dict[str, list] = {}
     try:
         prior_result = await run_orion(config=full_path, version=version, lookback=str(lookback * 2), input_vars=iv)
         prior_sum_raw = await summarize_result(prior_result)
         if isinstance(prior_sum_raw, dict):
             for run in prior_sum_raw.get("runs", []):
-                run_ts = run.get("timestamp", cutoff_ts)
-                if isinstance(run_ts, (int, float)) and run_ts >= cutoff_ts:
+                run_dt = parse_timestamp(run.get("timestamp"))
+                if run_dt is None or run_dt >= cutoff_dt:
                     continue
                 for m_name, m_data in run.get("metrics", {}).items():
                     v = m_data.get("value")
