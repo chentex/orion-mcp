@@ -591,66 +591,6 @@ def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
                     metric_data["percentage_change"] = None
 
 
-def _flatten_pr_summary(summaries: list[dict]) -> list[dict]:
-    """Convert raw orion PR result list into a flat per-config structure.
-
-    Input: list of per-config dicts with 'periodic_avg' and 'pulls' from run_orion PR mode.
-    Output: list of {config, runs: [{pull_number, metrics: [{name, baseline, pr_value, change_pct}]}]}.
-    Error entries pass through as {config, error}.
-    """
-    results = []
-    for summary in summaries:
-        config_name = os.path.basename(summary.get("config", "unknown"))
-
-        if "error" in summary:
-            results.append({"config": config_name, "error": summary["error"]})
-            continue
-
-        periodic_avg = summary.get("periodic_avg", {})
-        pulls_list = summary.get("pulls", [])
-
-        # Normalize baselines once
-        baselines = {}
-        for metric_name, raw in periodic_avg.items():
-            val = raw.get("value") if isinstance(raw, dict) else raw
-            baselines[metric_name] = round(val, 4) if isinstance(val, float) else val
-
-        # Build per-PR runs
-        pr_runs = []
-        for pull_obj in pulls_list:
-            pr_num = pull_obj.get("pull_number", "")
-            for dat in pull_obj.get("data", []):
-                run_metrics = []
-                for metric_name, metric_data in sorted(dat.get("metrics", {}).items()):
-                    pr_val = metric_data.get("value")
-                    if isinstance(pr_val, float):
-                        pr_val = round(pr_val, 4)
-                    pct = metric_data.get("percentage_change")
-                    if isinstance(pct, float):
-                        pct = round(pct, 2)
-                    run_metrics.append({
-                        "name": metric_name,
-                        "baseline": baselines.get(metric_name),
-                        "pr_value": pr_val,
-                        "change_pct": pct,
-                    })
-                pr_runs.append({
-                    "pull_number": pr_num,
-                    "buildUrl": dat.get("buildUrl"),
-                    "timestamp": dat.get("timestamp"),
-                    "metrics": run_metrics,
-                })
-
-        if not pr_runs:
-            results.append({"config": config_name, "error": "No PR test data"})
-            continue
-
-        results.append({
-            "config": config_name,
-            "runs": pr_runs,
-        })
-
-    return results
 
 
 @mcp.tool()
@@ -756,7 +696,7 @@ async def openshift_report_on_pr(
             "pulls": pulls_list,
         })
 
-    return _flatten_pr_summary(summaries)
+    return summaries
 
 
 def _extract_regression_details(stdout: str) -> list[dict]:
@@ -857,6 +797,24 @@ async def _run_regression_checks(
     return "No changepoints found"
 
 
+async def _check_regression(
+    ctx,
+    config_name,
+    input_vars,
+    version: str,
+    lookback: str,
+    default_configs: list[str] | None = None,
+) -> str:
+    """Shared body for regression tools — parse params, split configs, run checks."""
+    _extract_and_set_es_server(ctx)
+    try:
+        iv = _parse_input_vars(input_vars)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    configs = _split_configs(config_name, default=default_configs)
+    return await _run_regression_checks(configs, version=version, lookback=lookback, input_vars=iv)
+
+
 @mcp.tool()
 async def has_openshift_regressed(
     version: VersionParam = "4.19",
@@ -882,13 +840,7 @@ async def has_openshift_regressed(
         Changepoint details (config, version, PRs, metrics with % change)
         or "No changepoints found".
     """
-    _extract_and_set_es_server(ctx)
-    try:
-        iv = _parse_input_vars(input_vars)
-    except ValueError as exc:
-        return f"Error: {exc}"
-    configs = _split_configs(config_name)
-    return await _run_regression_checks(configs, version=version, lookback=lookback, input_vars=iv)
+    return await _check_regression(ctx, config_name, input_vars, version, lookback)
 
 
 # Networking configs are run inside payload jobs (no separate networking job).
@@ -923,13 +875,8 @@ async def has_networking_regressed(
     Returns:
         Changepoint details or "No changepoints found".
     """
-    _extract_and_set_es_server(ctx)
-    try:
-        iv = _parse_input_vars(input_vars)
-    except ValueError as exc:
-        return f"Error: {exc}"
-    configs = _split_configs(config_name, default=_DEFAULT_NETWORKING_CONFIGS)
-    return await _run_regression_checks(configs, version=version, lookback=lookback, input_vars=iv)
+    return await _check_regression(ctx, config_name, input_vars, version, lookback,
+                                   default_configs=_DEFAULT_NETWORKING_CONFIGS)
 
 # Correlation tool
 
@@ -1196,6 +1143,7 @@ async def _summarize_single_config(
     }
 
 
+
 @mcp.tool()
 async def get_performance_summary(
     version: VersionParam = "4.19",
@@ -1319,7 +1267,7 @@ def _load_config_metrics_with_meta(config_path: str, version: str = "", input_va
             for metric in mf_metrics:
                 if isinstance(metric, dict):
                     _process_metric(metric)
-        except Exception:
+        except (OSError, KeyError, ValueError, TypeError):
             pass
 
     top_metrics_file = rendered_config.get("metricsFile")
