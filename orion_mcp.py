@@ -5,22 +5,26 @@ This module provides tools for running performance regression analysis using
 the cloud-bulldozer/orion library.
 """
 
+import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
-from pydantic import Field
+
 import jinja2
 import yaml
-
 from mcp import types
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import Field
 
 # Import utility functions from utils module
 import httpx
 
+from utils.constants import ORION_CONFIGS_PATH, RELEASE_DATES
+from utils.header_decryption import get_es_config_from_headers
 from utils.utils import (
     run_orion,
     summarize_result,
@@ -36,22 +40,12 @@ from utils.utils import (
     get_es_metadata_index,
     current_es_config,  # Context variable for ES config isolation
 )
-from utils.header_decryption import get_es_config_from_headers
 
-RELEASE_DATES = {
-    "4.17": "2024-10-29",
-    "4.18": "2025-02-28",
-    "4.19": "2025-06-17",
-    "4.20": "2025-10-23",
-    "4.21": "2026-02-25",
-    "4.22": "2026-06-17",
-    "5.0": "2026-10-31",
-}
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP(name="orion-mcp",
               host="0.0.0.0",
-              port=3030,
-              log_level='INFO')
+              port=3030)
 
 ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/orion/examples/")
 ORION_CONFIGS = list_orion_configs()
@@ -559,6 +553,8 @@ async def openshift_report_on(
             label = f"{cfg}:{ver}" if len(configs) > 1 else ver
             series[label] = values
             full_data[ver] = sum_result
+            logger.debug("series: %s", series)
+
 
         all_errors.extend(errors)
         if series:
@@ -734,10 +730,21 @@ async def get_pr_details(
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as e:
-            print(f"Failed to parse orion output for {full_config_path}: {e}")
+            logger.error("Failed to parse orion output for %s: %s", full_config_path, e)
             continue
 
-        if not isinstance(data, dict) or "periodic_avg" not in data or "pulls" not in data:
+        if not isinstance(data, dict):
+            logger.error("Unexpected data type from orion: %s", type(data))
+            continue
+
+        if "periodic_avg" not in data:
+            logger.warning("Missing periodic_avg in orion output for %s", full_config_path)
+            continue
+
+        periodic_avg = data["periodic_avg"]
+
+        if "pulls" not in data:
+            logger.warning("Missing pulls in orion output for %s", full_config_path)
             continue
 
         pulls_list = data["pulls"]
@@ -1379,10 +1386,25 @@ def _load_config_metrics_with_meta(config_path: str, version: str = "", input_va
 
 
 if __name__ == "__main__":
+    import sys
+
+    parser = argparse.ArgumentParser(description="Orion MCP Server")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO)",
+    )
+    args = parser.parse_args()
+
+    log_level = getattr(logging, args.log_level)
+    logging.basicConfig(level=log_level, format="%(levelname)s:     %(message)s", force=True)
+    mcp.settings.log_level = args.log_level
+
     if os.getenv("ES_SERVER") is None:
-        print("ES_SERVER environment variable is not set")
-        import sys
+        logger.error("ES_SERVER environment variable is not set")
         sys.exit(1)
     TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
+    logger.info("Running MCP server with transport: %s", TRANSPORT)
     asyncio.run(mcp.run(transport=TRANSPORT))
 
