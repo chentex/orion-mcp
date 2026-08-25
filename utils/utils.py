@@ -24,8 +24,9 @@ import httpx
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Define ORION_CONFIGS_PATH locally to avoid circular import
-ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/orion/examples/")
+from utils.constants import ORION_CONFIGS_PATH
+
+logger = logging.getLogger(__name__)
 
 # Context variable for ES config from encrypted request headers
 # Provides async-safe isolation between concurrent requests
@@ -62,9 +63,9 @@ async def run_command_async(command: list[str] | str, env: Optional[dict] = None
     Returns:
         A subprocess.CompletedProcess-like object with args, returncode, stdout, stderr.
     """
-    print(f"Running command: {command}")
+    logger.debug("Running command: %s", command)
     if cwd:
-        print(f"Working directory: {cwd}")
+        logger.debug("Working directory: %s", cwd)
     if env is not None:
         env_vars = os.environ.copy()
         env_vars.update(env)
@@ -147,7 +148,7 @@ async def run_orion(
 
     command = []
     if not shutil.which("orion"):
-        print("Using orion from podman")
+        logger.info("Using orion from podman")
         command = ["podman", "run", "--env-host",
             "orion",
             "orion",
@@ -157,7 +158,7 @@ async def run_orion(
             "-o", "json"
         ]
     else:
-        print("Using orion from path")
+        logger.info("Using orion from path")
         command = [
             "orion",
             "--lookback", f"{lookback}d",
@@ -198,13 +199,11 @@ async def run_orion(
         "es_benchmark_index": es_benchmark_index,
     }
 
-    # Log env
-    print(f"Env: version={version}, es_metadata_index={es_metadata_index}, es_benchmark_index={es_benchmark_index}")
+    logger.debug("Env: version=%s, es_metadata_index=%s, es_benchmark_index=%s", version, es_metadata_index, es_benchmark_index)
     result = await run_command_async(command, env=env, cwd="/tmp")
-    # Log the full result for debugging
-    print(f"Orion return code: {result.returncode}")
-    print(f"Orion stdout: {result.stdout}")
-    print(f"Orion stderr: {result.stderr}")
+    logger.debug("Orion return code: %d", result.returncode)
+    logger.debug("Orion stdout: %s", result.stdout)
+    logger.debug("Orion stderr: %s", result.stderr)
     return result
 
 
@@ -226,8 +225,12 @@ async def summarize_result(result: subprocess.CompletedProcess, isolate: Optiona
 
         for run in data:
             for metric_name, metric_data in run["metrics"].items():
-                if isolate is not None and isolate != metric_name:
-                    continue
+                summary["timestamp"] = run["timestamp"]
+                # Isolate specific metric if specified
+                if isolate is not None:
+                    if isolate != metric_name:
+                        logger.debug("Skipping %s because it doesn't contain %s", metric_name, isolate)
+                        continue
                 if metric_name not in summary:
                     summary[metric_name] = {"value": [metric_data["value"]]}
                 else:
@@ -251,14 +254,14 @@ def get_data_source() -> str:
     # Check context variable first (set from encrypted header)
     es_config = current_es_config.get()
     if es_config and "es_server" in es_config:
-        print("Using ES_SERVER from encrypted request header")
+        logger.info("Using ES_SERVER from encrypted request header")
         return es_config["es_server"]
 
     # Fall back to environment variable
     value = os.environ.get("ES_SERVER")
     if value is None:
         raise EnvironmentError("ES_SERVER environment variable is not set")
-    print("Using ES_SERVER from environment variable")
+    logger.info("Using ES_SERVER from environment variable")
     return value
 
 
@@ -277,11 +280,11 @@ def get_es_metadata_index() -> str:
     # Check context variable first
     es_config = current_es_config.get()
     if es_config and "es_metadata_index" in es_config:
-        print("Using es_metadata_index from encrypted request header")
+        logger.info("Using es_metadata_index from encrypted request header")
         return es_config["es_metadata_index"]
 
     # Fall back to environment variable
-    print("Using es_metadata_index from environment/default")
+    logger.info("Using es_metadata_index from environment/default")
     return resolve_env_var("es_metadata_index", "ES_METADATA_INDEX", "perf_scale_ci*")
 
 
@@ -300,11 +303,11 @@ def get_es_benchmark_index() -> str:
     # Check context variable first
     es_config = current_es_config.get()
     if es_config and "es_benchmark_index" in es_config:
-        print("Using es_benchmark_index from encrypted request header")
+        logger.info("Using es_benchmark_index from encrypted request header")
         return es_config["es_benchmark_index"]
 
     # Fall back to environment variable
-    print("Using es_benchmark_index from environment/default")
+    logger.info("Using es_benchmark_index from environment/default")
     return resolve_env_var("es_benchmark_index", "ES_BENCHMARK_INDEX", "ripsaw-kube-burner-*")
 
 
@@ -330,6 +333,7 @@ async def orion_metrics(config_list: list, version: str = "4.20", input_vars: Op
         )
         try:
             sum_result = await summarize_result(result)
+            logger.debug("Sum result: %s", sum_result)
             if isinstance(sum_result, dict):
                 metrics[config] = [
                     key for key in sum_result.keys() if key not in {"runs", "timestamp"}
