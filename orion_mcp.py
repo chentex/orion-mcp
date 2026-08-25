@@ -29,6 +29,7 @@ from utils.utils import (
     orion_metrics,
     orion_configs,
     generate_correlation_plot,
+    generate_multi_line_plot,
     list_orion_configs,
     parse_nightly_version,
     parse_timestamp,
@@ -479,87 +480,115 @@ async def openshift_report_on(
     metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
     config_name: ConfigParam = None,
     input_vars: InputVarsParam = "",
+    options: Annotated[str, Field(description="Options in format 'output_format' or 'output_format:display_field'. Examples: 'image', 'json', 'both', 'json:ocpVirtVersion'")] = "image",
     ctx: Context = None,
-) -> dict:
-    """Compare or fetch a specific metric across OpenShift versions in a single call. Pass metric name and comma-separated versions (e.g. versions='4.22,5.0', metric='podReadyLatency_P99').
+) -> types.ImageContent | types.TextContent:
+    """Show or compare a specific metric across OpenShift versions. Use when a user asks to visualize, plot, or compare metric values across versions.
 
-    Triggers: "compare podReadyLatency_P99 for 4.22 vs 5.0", "show ovnCPU_avg values for 4.20",
-    "get podReadyLatency data", "etcdCPU numbers for 4.22 and 5.0".
+    Triggers: "show podReadyLatency for 4.22", "compare ovnCPU for 4.22 vs 5.0", "plot etcdCPU over time".
 
     Args:
-        versions: Comma-separated versions (default: '4.19'). Example: '4.22,5.0' for multi-version comparison.
+        versions: Comma-separated versions to analyze (default: '4.19'). E.g. '4.22,5.0'.
         lookback: Days to look back (default: '15').
         since: Start date for lookback (default: None).
-        metric: Metric to return (default: 'podReadyLatency_P99').
-        config_name: Orion config filename (e.g. 'cluster-density.yaml').
+        metric: Metric to plot (default: 'podReadyLatency_P99').
+        config_name: Orion config filename or comma-separated list (e.g. 'cluster-density.yaml,node-density.yaml').
+                     When multiple configs are provided, each appears as a separate line on the chart.
         input_vars: JSON string of template variables for the config.
+        options: Output format — 'image' (default), 'json', 'both', or 'json:displayField'.
 
     Returns:
-        Dict with config, metric, and per-version data.
-        Each version has: values (flat list of floats) and runs (list with timestamp, ocpVersion, buildUrl).
-        values[i] corresponds to runs[i].
+        Image (PNG chart) by default, or JSON data keyed by config and version when options='json'.
+        Single config returns {config, metric, data}; multiple configs return {results: [...]}.
     """
+    _extract_and_set_es_server(ctx)
+
+    if ":" in options:
+        output_format, display = options.split(":", 1)
+    else:
+        output_format = options
+        display = ""
+
     if isinstance(versions, str):
         version_list = [v.strip() for v in versions.split(',') if v.strip()]
     else:
         version_list = list(versions)
 
-    if not version_list:
-        return {"error": "No valid versions provided"}
+    first_ver = version_list[0] if version_list else "4.19"
+    configs = _split_configs(config_name)
+    if not configs:
+        config_value, iv = await _resolve_config_and_vars(ctx, None, first_ver, input_vars)
+        configs = [config_value]
+    else:
+        _, iv = await _resolve_config_and_vars(ctx, None, first_ver, input_vars)
 
-    config_value, iv = await _resolve_config_and_vars(
-        ctx, config_name, version_list[0], input_vars,
-    )
+    all_series: dict[str, list[float]] = {}
+    all_full_data: list[dict] = []
+    all_errors = []
 
-    output: dict = {
-        "config": config_value,
-        "metric": metric,
-        "versions": {},
-    }
+    for cfg in configs:
+        series: dict[str, list[float]] = {}
+        full_data: dict[str, dict] = {}
+        errors = []
 
-    errors = []
-    for ver in version_list:
-        ver_iv = dict(iv, version=ver) if iv else None
-        result = await run_orion(
-            config=_config_path(config_value),
-            version=ver,
-            lookback=lookback,
-            since=since,
-            input_vars=ver_iv,
-        )
+        for ver in version_list:
+            result = await run_orion(
+                config=_config_path(cfg),
+                version=ver,
+                lookback=lookback,
+                since=since,
+                input_vars=iv,
+                display=display if display.strip() else None,
+            )
 
-        sum_result = await summarize_result(result, isolate=metric)
+            sum_result = await summarize_result(result, isolate=metric)
 
-        if not isinstance(sum_result, dict) or metric not in sum_result:
-            errors.append(f"No data for version {ver}: {sum_result}")
-            continue
-
-        raw_runs = sum_result.get("runs", [])
-        values = []
-        runs_context = []
-        for run in raw_runs:
-            v = run.get("metrics", {}).get(metric, {}).get("value")
-            if v is None:
+            if not isinstance(sum_result, dict) or metric not in sum_result:
+                errors.append(f"[{cfg}] No data for version {ver}: {sum_result}")
                 continue
-            values.append(v)
-            runs_context.append({
-                "timestamp": run.get("timestamp"),
-                "ocpVersion": run.get("ocpVersion"),
-                "buildUrl": run.get("buildUrl"),
-            })
 
-        if not values:
-            errors.append(f"All values are None for version {ver}")
-            continue
+            raw_values = sum_result[metric].get("value", [])
+            if not isinstance(raw_values, list):
+                errors.append(f"[{cfg}] Unexpected data format for version {ver}")
+                continue
 
-        output["versions"][ver] = {"values": values, "runs": runs_context}
+            values = [v for v in raw_values if v is not None]
+            if not values:
+                errors.append(f"[{cfg}] All values are None for version {ver}")
+                continue
 
-    if errors:
-        output["errors"] = errors
-    if not output["versions"]:
-        output["error"] = "No data found for any version"
+            label = f"{cfg}:{ver}" if len(configs) > 1 else ver
+            series[label] = values
+            full_data[ver] = sum_result
 
-    return output
+        all_errors.extend(errors)
+        if series:
+            all_series.update(series)
+            all_full_data.append({"config": cfg, "metric": metric, "lookback": lookback,
+                                   "display": display if display.strip() else None, "data": full_data})
+
+    if all_errors and not all_series:
+        return types.TextContent(type="text", text="\n".join(all_errors))
+
+    if output_format.lower() == "json":
+        output = all_full_data[0] if len(all_full_data) == 1 else {"results": all_full_data}
+        return types.TextContent(type="text", text=json.dumps(output, indent=2))
+
+    if output_format.lower() == "both":
+        output = all_full_data[0] if len(all_full_data) == 1 else {"results": all_full_data}
+        output["plot_info"] = "Image data follows JSON data"
+        try:
+            img_b64 = generate_multi_line_plot(all_series, metric)
+            combined = json.dumps(output, indent=2) + "\n\n[IMAGE_DATA_BASE64]\n" + img_b64.decode("utf-8")
+            return types.TextContent(type="text", text=combined)
+        except ValueError as e:
+            return types.TextContent(type="text", text=f"Error generating plot: {e}\n\nJSON data:\n{json.dumps(output, indent=2)}")
+
+    try:
+        img_b64 = generate_multi_line_plot(all_series, metric)
+        return types.ImageContent(type="image", data=img_b64.decode("utf-8"), mimeType="image/jpeg")
+    except ValueError as e:
+        return types.TextContent(type="text", text=str(e))
 
 
 def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
@@ -594,67 +623,112 @@ def _add_percentage_changes(pulls_list: list[dict], periodic_avg: dict) -> None:
 
 
 @mcp.tool()
-async def openshift_report_on_pr(
-    version: Annotated[str, Field(description="OpenShift version to analyze")] = "4.20",
-    *,
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
-    organization: Annotated[str, Field(description="Organization to look into")] = "openshift",
-    repository: Annotated[str, Field(description="Repository to look into")] = "ovn-kubernetes",
-    pull_request: Annotated[str, Field(description="PR number to analyze (for single PR)")] = "2841",
-    pull_requests: Annotated[str, Field(description="Comma-separated PR numbers to compare (e.g. '3169,3170'). Overrides pull_request if provided.")] = "",
+async def get_orion_performance_data(
     config_name: ConfigParam = None,
+    *,
+    metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
+    version: VersionParam = "4.19",
+    lookback: LookbackParam = "15",
+    since: Annotated[str | None, Field(description="Date to begin looking back for performance data")] = None,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
-) -> list[dict]:
-    """Analyze how a GitHub pull request affected CI performance by comparing PR test runs against periodic baselines. Use when a user says "analyze PR", "check PR impact", or provides a PR number or GitHub PR URL. Input: PR number + org/repo.
+) -> dict:
+    """Return flat metric values for programmatic use (min/max/avg computation). Use when raw values are needed rather than a chart.
 
-    Triggers: "analyze pr 3332", "analyze pr https://github.com/openshift/ovn-kubernetes/pull/3332",
-    "how did PR 3317 affect performance", "check PR impact on 5.0".
-
-    Compares PR CI test runs against periodic baseline averages.
+    Triggers: "get raw podReadyLatency values for 4.22", "fetch ovnCPU numbers for cluster-density".
 
     Args:
-        version: OpenShift version to compare against (default: '4.20').
-        lookback: Days to look back (default: '15').
-        organization: GitHub organization (default: 'openshift').
-        repository: GitHub repository (default: 'ovn-kubernetes').
-        pull_request: Single PR number (default: '2841').
-        pull_requests: Comma-separated PR numbers for multi-PR comparison (default: empty).
         config_name: Orion config filename or comma-separated list (e.g. 'cluster-density.yaml,node-density.yaml').
+        metric: Metric to fetch (default: 'podReadyLatency_P99').
+        version: OpenShift version (default: '4.19').
+        lookback: Days to look back (default: '15').
+        since: Start date for lookback (default: None).
         input_vars: JSON string of template variables for the config.
 
     Returns:
-        List grouped by config. Each entry has config and runs (list of per-PR-run results).
-        Each run has: pull_number, buildUrl, timestamp, and metrics list.
-        Each metric has: name, baseline, pr_value, change_pct.
-        Error entries have: config, error.
+        Single config: {config, metric, version, lookback, values: [float, ...], count}.
+        Multiple configs: {results: [{config, metric, version, lookback, values, count}, ...]}.
     """
     _extract_and_set_es_server(ctx)
-    try:
-        iv = _parse_input_vars(input_vars)
-    except ValueError as exc:
-        return [{"config": config_name or DEFAULT_CONFIG, "error": str(exc)}]
     configs = _split_configs(config_name)
-
-    if pull_requests and pull_requests.strip():
-        pr_list = [pr.strip() for pr in pull_requests.split(",") if pr.strip()]
+    if not configs:
+        config_value, iv = await _resolve_config_and_vars(ctx, None, version, input_vars)
+        configs = [config_value]
     else:
-        pr_list = [pull_request]
+        _, iv = await _resolve_config_and_vars(ctx, None, version, input_vars)
 
+    results = []
+    for cfg in configs:
+        try:
+            result = await run_orion(
+                config=_config_path(cfg),
+                version=version,
+                lookback=lookback,
+                since=since,
+                input_vars=iv,
+            )
+            sum_result = await summarize_result(result, isolate=metric)
+
+            if not isinstance(sum_result, dict) or metric not in sum_result:
+                results.append({"config": cfg, "error": f"No data found for metric {metric}"})
+                continue
+
+            values = sum_result[metric].get("value", [])
+            if not isinstance(values, list):
+                results.append({"config": cfg, "error": f"Unexpected data format for metric {metric}"})
+                continue
+
+            values = [v for v in values if v is not None]
+            results.append({
+                "config": cfg,
+                "metric": metric,
+                "version": version,
+                "lookback": lookback,
+                "values": values,
+                "count": len(values),
+            })
+        except Exception as e:
+            results.append({"config": cfg, "error": str(e)})
+
+    return results[0] if len(results) == 1 else {"results": results}
+
+
+async def get_pr_details(
+    organization: str,
+    repository: str,
+    pull_requests: list[str],
+    version: str = "4.20",
+    lookback: str = "15",
+    *,
+    configs: list[str] | None = None,
+    input_vars: dict | None = None,
+) -> list[dict]:
+    """Get PR performance analysis details by running Orion with input variables."""
+    if configs is None:
+        configs = [
+            "trt-external-payload-cluster-density.yaml",
+            "trt-external-payload-node-density.yaml",
+            "trt-external-payload-node-density-cni.yaml",
+            "trt-external-payload-crd-scale.yaml",
+            "trt-external-payload-udn-density-pods.yaml",
+        ]
+
+    if not pull_requests:
+        raise ValueError("At least one pull request number is required")
     try:
-        pull_numbers = [int(pr) for pr in pr_list]
-    except ValueError:
-        return [{"config": configs[0], "error": "Pull request numbers must be integers"}]
+        pull_numbers = [int(pr) for pr in pull_requests]
+    except ValueError as exc:
+        raise ValueError("Pull request numbers must be integers") from exc
 
-    pr_iv = dict(iv) if iv else {}
+    pr_iv = dict(input_vars) if input_vars else {}
     pr_iv["jobtype"] = "pull"
     pr_iv["organization"] = organization
     pr_iv["repository"] = repository
-    pr_iv["pull_number"] = pr_list[0]
+    pr_iv["pull_number"] = pull_requests[0]
 
     summaries: list[dict] = []
-    for config_value in configs:
-        full_config_path = _config_path(config_value)
+    for config in configs:
+        full_config_path = _config_path(config)
         result = await run_orion(
             config=full_config_path,
             version=version,
@@ -666,37 +740,76 @@ async def openshift_report_on_pr(
 
         try:
             data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            stderr_snippet = _orion_error_snippet(result)
-            summaries.append({"config": full_config_path, "error": f"Orion failed (exit {result.returncode}): {stderr_snippet}"})
+        except json.JSONDecodeError as e:
+            logger.debug("Failed to parse orion output for %s: %s", full_config_path, e)
             continue
 
-        if not isinstance(data, dict):
-            summaries.append({"config": full_config_path, "error": f"Unexpected data type: {type(data).__name__}"})
+        if not isinstance(data, dict) or "periodic_avg" not in data or "pulls" not in data:
             continue
 
-        if "periodic_avg" not in data or "pulls" not in data:
-            summaries.append({"config": full_config_path, "error": "No PR test data"})
-            continue
-
-        periodic_avg = data["periodic_avg"]
         pulls_list = data["pulls"]
-        _add_percentage_changes(pulls_list, periodic_avg)
-
-        for pull_obj in pulls_list:
-            for dat in pull_obj.get("data", []):
-                for key in ("uuid", "is_changepoint", "prs", "ocpVersion"):
-                    dat.pop(key, None)
-                for metric_data in dat.get("metrics", {}).values():
-                    metric_data.pop("labels", None)
+        _add_percentage_changes(pulls_list, data["periodic_avg"])
 
         summaries.append({
             "config": full_config_path,
-            "periodic_avg": periodic_avg,
+            "periodic_avg": data["periodic_avg"],
             "pulls": pulls_list,
         })
 
     return summaries
+
+
+@mcp.tool()
+async def openshift_report_on_pr(
+    version: Annotated[str, Field(description="OpenShift version to analyze")] = "4.20",
+    *,
+    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
+    organization: Annotated[str, Field(description="Organization to look into")] = "openshift",
+    repository: Annotated[str, Field(description="Repository to look into")] = "ovn-kubernetes",
+    pull_request: Annotated[str, Field(description="PR number to analyze (for single PR)")] = "2841",
+    pull_requests: Annotated[str, Field(description="Comma-separated PR numbers to compare (e.g. '3169,3170'). Overrides pull_request if provided.")] = "",
+    config_name: ConfigParam = None,
+    input_vars: InputVarsParam = "",
+    ctx: Context = None,
+) -> dict:
+    """
+    Captures a performance analysis against the specified OpenShift version using Orion.
+
+    Args:
+        version: OpenShift version to analyze.
+        lookback: The number of days to look back for performance data. Defaults to 15 days.
+        organization: The organization to look into. Defaults to openshift.
+        repository: The repository to look into. Defaults to ovn-kubernetes.
+        pull_request: Single PR number to analyze. Defaults to 2841.
+        pull_requests: Comma-separated PR numbers for multi-PR comparison (e.g. '3169,3170').
+        config_name: Orion config filename or comma-separated list (e.g. 'cluster-density.yaml,node-density.yaml').
+        input_vars: JSON string of template variables for the config.
+
+    Returns:
+        Dictionary with summaries containing PR analysis results for each config.
+    """
+    _extract_and_set_es_server(ctx)
+
+    try:
+        iv = _parse_input_vars(input_vars)
+    except ValueError as exc:
+        return {"summaries": [], "error": str(exc)}
+
+    if pull_requests and pull_requests.strip():
+        pr_list = [pr.strip() for pr in pull_requests.split(",") if pr.strip()]
+    else:
+        pr_list = [pull_request]
+
+    configs = _split_configs(config_name) or None
+
+    summaries = await get_pr_details(organization, repository, pr_list, version, lookback,
+                                     configs=configs, input_vars=iv)
+    if not summaries:
+        return {
+            "summaries": [],
+            "message": "No performance data found for this PR. Please ensure the PR has been tested and the version is correct."
+        }
+    return {"summaries": summaries}
 
 
 def _extract_regression_details(stdout: str) -> list[dict]:
@@ -1058,6 +1171,7 @@ def _timestamp_after(timestamp_val, cutoff_datetime: datetime) -> bool:
 async def _summarize_single_config(
     config_value: str, version: str, lookback: int, iv: dict | None,
 ) -> dict:
+    """Run Orion for one config and compute per-metric min/max/avg/change% stats."""
     full_path = _config_path(config_value)
 
     try:
@@ -1066,12 +1180,7 @@ async def _summarize_single_config(
         return {"config": config_value, "success": False, "error": f"Failed to load config metrics: {e}"}
 
     try:
-        result = await run_orion(
-            config=full_path,
-            version=version,
-            lookback=str(lookback),
-            input_vars=iv,
-        )
+        result = await run_orion(config=full_path, version=version, lookback=str(lookback), input_vars=iv)
         sum_result = await summarize_result(result)
     except Exception as e:
         return {"config": config_value, "success": False, "error": f"Orion failed: {e}"}
@@ -1079,29 +1188,21 @@ async def _summarize_single_config(
     if not isinstance(sum_result, dict):
         return {"config": config_value, "success": False, "error": f"Unexpected Orion output: {sum_result}"}
 
-    # Fetch double-lookback window, then select runs whose timestamp falls
-    # strictly before the current-window cutoff to avoid mixing windows.
+    # Prior window: double lookback, filter to runs strictly before current window cutoff
     cutoff_ts = datetime.now().timestamp() - lookback * 86400
-    prior_sum = {}
+    prior_sum: dict[str, list] = {}
     try:
-        prior_result = await run_orion(
-            config=full_path,
-            version=version,
-            lookback=str(lookback * 2),
-            input_vars=iv,
-        )
+        prior_result = await run_orion(config=full_path, version=version, lookback=str(lookback * 2), input_vars=iv)
         prior_sum_raw = await summarize_result(prior_result)
         if isinstance(prior_sum_raw, dict):
-            prior_runs = prior_sum_raw.get("runs", [])
-            for run in prior_runs:
+            for run in prior_sum_raw.get("runs", []):
                 run_ts = run.get("timestamp", cutoff_ts)
                 if isinstance(run_ts, (int, float)) and run_ts >= cutoff_ts:
                     continue
                 for m_name, m_data in run.get("metrics", {}).items():
-                    prior_sum.setdefault(m_name, [])
                     v = m_data.get("value")
                     if v is not None:
-                        prior_sum[m_name].append(v)
+                        prior_sum.setdefault(m_name, []).append(v)
     except Exception as exc:
         logger.debug("Prior-period query failed for %s: %s", config_value, exc)
 
@@ -1109,22 +1210,17 @@ async def _summarize_single_config(
     for m_name in metrics_list:
         if m_name not in sum_result:
             continue
-        values = sum_result[m_name].get("value", [])
-        values = [v for v in values if v is not None]
+        values = [v for v in sum_result[m_name].get("value", []) if v is not None]
         if not values:
             continue
-
         avg_val = sum(values) / len(values)
         meta = meta_map.get(m_name, {})
-
-        change_pct = None
         previous_values = prior_sum.get(m_name, [])
+        change_pct = None
         if previous_values:
-            previous_avg = sum(previous_values) / len(previous_values)
-            current_avg = avg_val
-            if previous_avg != 0:
-                change_pct = round(((current_avg - previous_avg) / abs(previous_avg)) * 100, 2)
-
+            prev_avg = sum(previous_values) / len(previous_values)
+            if prev_avg != 0:
+                change_pct = round(((avg_val - prev_avg) / abs(prev_avg)) * 100, 2)
         metric_summaries.append({
             "name": m_name,
             "runs": len(values),
@@ -1136,14 +1232,12 @@ async def _summarize_single_config(
             "threshold": meta.get("threshold"),
         })
 
-    return {
-        "config": config_value,
-        "success": len(metric_summaries) > 0,
-        "metrics": metric_summaries,
-    }
+    return {"config": config_value, "success": bool(metric_summaries), "metrics": metric_summaries}
 
 
-
+# get_performance_summary replaces the N-per-metric call pattern: previously callers like BugZooka
+# called a per-metric tool in a loop — O(metrics × configs × 2) ES round trips for a health check.
+# This tool collapses that to O(configs) by aggregating all metrics server-side in one call.
 @mcp.tool()
 async def get_performance_summary(
     version: VersionParam = "4.19",
@@ -1152,9 +1246,9 @@ async def get_performance_summary(
     input_vars: InputVarsParam = "",
     ctx: Context = None,
 ) -> dict:
-    """Health check — aggregated stats (min, max, avg, change%) across ALL metrics for one or more configs.
+    """Health check — aggregated stats (min, max, avg, change%) across ALL metrics for one or more configs. Use when a user asks for an overall performance summary or health check for a version.
 
-    Triggers: "how is 4.22 doing overall", "give me a health check for 5.0",
+    Triggers: "how is 4.22 doing overall", "give me a performance summary for 5.0",
     "is 4.20 healthy", "overall performance report for 4.22".
 
     Args:
@@ -1164,26 +1258,26 @@ async def get_performance_summary(
         input_vars: JSON string of template variables for the config.
 
     Returns:
-        Dict with per-config results, each containing per-metric stats.
+        Dict with per-config results, each containing per-metric stats (min, max, avg, change_percent, direction, threshold).
     """
     _extract_and_set_es_server(ctx)
     try:
         iv = _parse_input_vars(input_vars)
     except ValueError as exc:
         return {"success": False, "error": str(exc), "results": []}
+
     configs = _split_configs(config_name)
     if not configs:
-        config_value, iv = await _resolve_config_and_vars(ctx, config_name, version, input_vars)
+        config_value, iv = await _resolve_config_and_vars(ctx, None, version, input_vars)
         configs = [config_value]
 
     results = await asyncio.gather(*[
         _summarize_single_config(c, version, lookback, iv) for c in configs
     ])
 
-    return {
-        "success": any(r.get("success") for r in results),
-        "results": list(results),
-    }
+    return {"success": any(r.get("success") for r in results), "results": list(results)}
+
+
 
 
 def _metric_key(metric: dict) -> str:
