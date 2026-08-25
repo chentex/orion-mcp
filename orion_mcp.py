@@ -330,7 +330,7 @@ async def discover_jobs(
                     "benchmarks": {"terms": {"field": "benchmark.keyword", "size": 10}},
                     "top_hit": {
                         "top_hits": {
-                            "size": 3,
+                            "size": 20 if job_type == "pull" else 3,
                             "sort": [{"timestamp": {"order": "desc"}}],
                             "_source": [
                                 "platform", "clusterType", "workerNodesCount",
@@ -367,7 +367,8 @@ async def discover_jobs(
         job_name = bucket["key"]
         benchmarks = [b["key"] for b in bucket.get("benchmarks", {}).get("buckets", [])]
         hits = bucket.get("top_hit", {}).get("hits", {}).get("hits", [])
-        # Use latest run for metadata, collect up to 3 buildUrls for config resolution
+        # Use latest run for metadata; collect up to 20 buildUrls for pull jobs (skill needs
+        # to find a specific PR number in the URLs), 3 for periodic (just need a recent run)
         metadata = hits[0]["_source"] if hits else {}
         build_urls = [h["_source"].get("buildUrl", "") for h in hits if h["_source"].get("buildUrl")]
 
@@ -704,14 +705,8 @@ async def get_pr_details(
     input_vars: dict | None = None,
 ) -> list[dict]:
     """Get PR performance analysis details by running Orion with input variables."""
-    if configs is None:
-        configs = [
-            "trt-external-payload-cluster-density.yaml",
-            "trt-external-payload-node-density.yaml",
-            "trt-external-payload-node-density-cni.yaml",
-            "trt-external-payload-crd-scale.yaml",
-            "trt-external-payload-udn-density-pods.yaml",
-        ]
+    if not configs:
+        raise ValueError("config_name is required — call discover_jobs with job_type='pull' first to resolve PR configs")
 
     if not pull_requests:
         raise ValueError("At least one pull request number is required")
@@ -800,10 +795,16 @@ async def openshift_report_on_pr(
     else:
         pr_list = [pull_request]
 
-    configs = _split_configs(config_name) or None
+    configs = _split_configs(config_name)
+    if not configs:
+        return {"summaries": [], "error": "config_name is required — call discover_jobs with job_type='pull' first to resolve PR configs"}
 
-    summaries = await get_pr_details(organization, repository, pr_list, version, lookback,
-                                     configs=configs, input_vars=iv)
+    try:
+        summaries = await get_pr_details(organization, repository, pr_list, version, lookback,
+                                         configs=configs, input_vars=iv)
+    except ValueError as exc:
+        return {"summaries": [], "error": str(exc)}
+
     if not summaries:
         return {
             "summaries": [],
