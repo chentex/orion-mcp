@@ -7,7 +7,6 @@ the cloud-bulldozer/orion library.
 
 import asyncio
 import json
-import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -63,7 +62,6 @@ _VERIFY_TLS = os.getenv("ORION_VERIFY_TLS", "true").lower() != "false"
 # Semaphore to cap concurrent prow/gcsweb requests per discover_jobs call
 _PROW_SEMAPHORE = asyncio.Semaphore(15)
 
-logger = logging.getLogger(__name__)
 
 # Common parameter types — define once, reuse across all tools
 VersionParam = Annotated[str, Field(description="OpenShift version (e.g. '4.22', '5.0')")]
@@ -261,7 +259,7 @@ async def _resolve_configs_from_prow(build_url: str) -> list[str]:
             results = await asyncio.gather(*[_fetch_config(d) for d in orion_dirs])
             configs = {r for r in results if r}
     except Exception as exc:
-        logger.warning("Failed to resolve configs from prow: %s", exc)
+        print(f"Failed to resolve configs from prow: {exc}")
 
     return sorted(configs)
 
@@ -736,7 +734,7 @@ async def get_pr_details(
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as e:
-            logger.debug("Failed to parse orion output for %s: %s", full_config_path, e)
+            print(f"Failed to parse orion output for {full_config_path}: {e}")
             continue
 
         if not isinstance(data, dict) or "periodic_avg" not in data or "pulls" not in data:
@@ -1205,7 +1203,7 @@ async def _summarize_single_config(
                     if v is not None:
                         prior_sum.setdefault(m_name, []).append(v)
     except Exception as exc:
-        logger.debug("Prior-period query failed for %s: %s", config_value, exc)
+        print(f"Prior-period query failed for {config_value}: {exc}")
 
     metric_summaries = []
     for m_name in metrics_list:
