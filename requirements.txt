@@ -1,17 +1,16 @@
-# Core MCP framework and its key dependencies
-mcp==1.18.0
-pydantic>=2.11.0
-pydantic_core>=2.33.0
-typing_extensions>=4.15.0
+# Core MCP framework
+fastmcp==4.0.0
+
+# Data validation (directly imported: from pydantic import Field)
+pydantic>=2.7.0
 
 # Data visualization and numerical computing
 matplotlib>=3.10.0
 numpy>=1.24.0
 
-# Additional MCP dependencies (usually auto-installed but specified for robustness)
+# Additional dependencies
 anyio>=4.5.0
 httpx>=0.27.1
-httpx-sse>=0.4.0
 uvicorn>=0.31.1
 jinja2>=3.1.0
 pyyaml>=6.0.1
