@@ -49,10 +49,20 @@ async def metrics_correlation(
     if not isinstance(summary, dict):
         return f"Error processing Orion output: {summary}"
 
-    try:
-        values1 = summary[metric1]["value"]
-        values2 = summary[metric2]["value"]
-    except KeyError:
+    if "runs" not in summary:
+        return "No run data available for correlation analysis."
+
+    values1: list[float] = []
+    values2: list[float] = []
+    for run in summary["runs"]:
+        metrics = run.get("metrics", {})
+        v1 = metrics.get(metric1, {}).get("value") if isinstance(metrics.get(metric1), dict) else None
+        v2 = metrics.get(metric2, {}).get("value") if isinstance(metrics.get(metric2), dict) else None
+        if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+            values1.append(v1)
+            values2.append(v2)
+
+    if not values1:
         return "Requested metrics not present in the Orion summary for the chosen configuration."
 
     corr_b64 = generate_correlation_plot(values1, values2, metric1, metric2, title_prefix=f"{config_value}: ")

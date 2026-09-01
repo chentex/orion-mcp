@@ -1,4 +1,5 @@
 """Shared constants for orion-mcp."""
+import os
 
 # AES-256-GCM parameters for symmetric decryption of header payloads
 AES_GCM_KEY_LENGTH_BYTES = 32
@@ -14,7 +15,7 @@ RELEASE_DATES = {
     "5.0": "2026-10-31",
 }
 
-ORION_CONFIGS_PATH = "/Users/vzepedam/code/orion/examples/"
+ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/orion/examples/")
 
 DEFAULT_ORION_CONFIGS = [
     "metal-perfscale-cpt-virt-udn-density.yaml",

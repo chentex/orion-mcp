@@ -39,7 +39,10 @@ def _render_config_yaml(config_path: str, version: str) -> dict:
         template = jinja2.Template(template_content)
         rendered = template.render(env_vars)
 
-    return yaml.safe_load(rendered)
+    result = yaml.safe_load(rendered)
+    if not isinstance(result, dict):
+        raise ValueError(f"Expected YAML mapping in {config_path}, got {type(result).__name__}")
+    return result
 
 
 def _load_config_metrics_with_meta(config_path: str, version: str) -> tuple[list[str], dict]:

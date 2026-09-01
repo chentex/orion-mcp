@@ -88,8 +88,10 @@ async def openshift_report_on(
             "metric": metric,
             "lookback": lookback,
             "display": display if display.strip() else None,
-            "data": full_data
+            "data": full_data,
         }
+        if errors:
+            json_output["warnings"] = errors
         return json.dumps(json_output, indent=2)
 
     if output_format.lower() == "both":
@@ -99,8 +101,10 @@ async def openshift_report_on(
             "lookback": lookback,
             "display": display if display.strip() else None,
             "data": full_data,
-            "plot_info": "Image data follows JSON data"
+            "plot_info": "Image data follows JSON data",
         }
+        if errors:
+            json_output["warnings"] = errors
         try:
             img_b64 = generate_multi_line_plot(series, metric, title_prefix=f"{config_value}: ")
             combined_output = json.dumps(json_output, indent=2) + "\n\n[IMAGE_DATA_BASE64]\n" + img_b64.decode("utf-8")

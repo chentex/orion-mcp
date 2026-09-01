@@ -169,6 +169,21 @@ class TestSafeJsonLoads:
         result = safe_json_loads('LOG [{"a": 1}] trailing')
         assert result == [{"a": 1}]
 
+    def test_bracketed_log_prefix(self):
+        """Verify JSON is found after bracketed log lines like [INFO]."""
+        result = safe_json_loads('[INFO] starting\n[{"key": "value"}]')
+        assert result == [{"key": "value"}]
+
+    def test_bracketed_log_suffix(self):
+        """Verify trailing bracketed text doesn't corrupt parsing."""
+        result = safe_json_loads('[{"key": "value"}]\n[DONE]')
+        assert result == [{"key": "value"}]
+
+    def test_mixed_brackets_in_logs(self):
+        """Verify parser handles logs with brackets on both sides."""
+        result = safe_json_loads('[WARN] debug\n{"data": [1, 2]}\n[END]')
+        assert result == {"data": [1, 2]}
+
     def test_no_json_raises(self):
         """Verify JSONDecodeError when no JSON is present."""
         with pytest.raises(json.JSONDecodeError):

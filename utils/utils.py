@@ -16,7 +16,7 @@ import shutil
 import subprocess
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -24,8 +24,7 @@ import httpx
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Define ORION_CONFIGS_PATH locally to avoid circular import
-ORION_CONFIGS_PATH = "/orion/examples/"
+from utils.constants import ORION_CONFIGS_PATH  # noqa: E402
 
 # Context variable for ES config from encrypted request headers
 # Provides async-safe isolation between concurrent requests
@@ -217,23 +216,19 @@ def validate_config_name(config_name: str) -> str:
 
 
 def safe_json_loads(raw: str) -> list | dict:
-    """Parse JSON from Orion stdout, stripping non-JSON prefix/suffix."""
+    """Parse JSON from Orion stdout, scanning for the first valid JSON value."""
     text = raw.strip()
-    start = text.find("[")
-    start_obj = text.find("{")
-    if start == -1 and start_obj == -1:
-        raise json.JSONDecodeError("No JSON found", text, 0)
-    if start == -1:
-        start = start_obj
-    elif start_obj != -1:
-        start = min(start, start_obj)
-
-    bracket = text[start]
-    close = "]" if bracket == "[" else "}"
-    end = text.rfind(close)
-    if end == -1:
-        raise json.JSONDecodeError("No closing bracket found", text, start)
-    return json.loads(text[start:end + 1])
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (list, dict)):
+            return value
+    raise json.JSONDecodeError("No JSON found", text, 0)
 
 
 async def summarize_result(result: subprocess.CompletedProcess, isolate: Optional[str] = None) -> dict | str:
@@ -605,23 +600,26 @@ def parse_nightly_version(version_string: str) -> NightlyVersionInfo:
 
 def parse_timestamp(timestamp_val) -> Optional[datetime]:
     """
-    Parse a timestamp value into a datetime object.
+    Parse a timestamp value into a naive UTC datetime.
 
     Args:
         timestamp_val: Unix timestamp (int/float), ISO string, or numeric string.
 
     Returns:
-        Parsed datetime, or None if unparseable.
+        Parsed naive datetime (UTC), or None if unparseable.
     """
     try:
         if isinstance(timestamp_val, (int, float)):
-            return datetime.fromtimestamp(timestamp_val)
+            return datetime.utcfromtimestamp(timestamp_val)
         if isinstance(timestamp_val, str):
             try:
-                return datetime.fromtimestamp(float(timestamp_val))
+                return datetime.utcfromtimestamp(float(timestamp_val))
             except ValueError:
-                ts_clean = timestamp_val.replace("Z", "").split("+")[0].split(".")[0]
-                return datetime.fromisoformat(ts_clean)
+                ts_clean = timestamp_val.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(ts_clean)
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
     except (ValueError, TypeError, OSError):
         pass
     return None
