@@ -1,3 +1,5 @@
+"""Tools for detecting OpenShift performance regressions via Orion."""
+# pylint: disable=duplicate-code
 import json
 import os
 from typing import Annotated
@@ -6,7 +8,7 @@ from pydantic import Field
 from fastmcp import Context
 from fastmcp.tools import tool
 
-from utils.constants import ORION_CONFIGS_PATH
+from utils.constants import ORION_CONFIGS_PATH, DEFAULT_TRT_CONFIGS
 from utils.utils import (
     run_orion,
     parse_nightly_version,
@@ -113,14 +115,7 @@ async def has_openshift_regressed(
     """
     extract_and_set_es_server(ctx)
 
-    configs = [
-        "trt-external-payload-cluster-density.yaml",
-        "trt-external-payload-node-density.yaml",
-        "trt-external-payload-node-density-cni.yaml",
-        "trt-external-payload-crd-scale.yaml",
-        "trt-external-payload-udn-density-pods.yaml",
-    ]
-    return await _run_regression_checks(configs, version=version, lookback=lookback)
+    return await _run_regression_checks(DEFAULT_TRT_CONFIGS, version=version, lookback=lookback)
 
 
 @tool
@@ -176,13 +171,7 @@ async def has_nightly_regressed(
         if prev_nightly_info.nightly_date >= nightly_info.nightly_date:
             return "Error: previous_nightly must be earlier than nightly_version."
 
-    config_list = ([c.strip() for c in configs.split(",") if c.strip()] if configs.strip() else [
-        "trt-external-payload-cluster-density.yaml",
-        "trt-external-payload-node-density.yaml",
-        "trt-external-payload-node-density-cni.yaml",
-        "trt-external-payload-crd-scale.yaml",
-        "trt-external-payload-udn-density-pods.yaml",
-    ])
+    config_list = ([c.strip() for c in configs.split(",") if c.strip()] if configs.strip() else DEFAULT_TRT_CONFIGS)
 
     all_regressions: list[str] = []
 

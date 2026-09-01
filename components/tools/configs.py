@@ -1,3 +1,4 @@
+"""Tool for listing available Orion configuration files."""
 from fastmcp.tools import tool
 
 from utils.utils import orion_configs, list_orion_configs

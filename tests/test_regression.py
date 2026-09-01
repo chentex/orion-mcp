@@ -1,14 +1,19 @@
+"""Tests for regression detection helpers."""
 import json
 
 from components.tools.regression import _extract_regression_details
 
 
 class TestExtractRegressionDetails:
+    """Tests for _extract_regression_details parser."""
+
     def test_no_changepoints(self):
+        """Verify empty list when no changepoints exist."""
         data = [{"is_changepoint": False, "metrics": {}}]
-        assert _extract_regression_details(json.dumps(data)) == []
+        assert not _extract_regression_details(json.dumps(data))
 
     def test_single_changepoint(self):
+        """Verify correct extraction of a single changepoint."""
         data = [
             {"ocpVersion": "4.18", "prs": ["PR1"], "is_changepoint": False, "metrics": {}},
             {
@@ -32,6 +37,7 @@ class TestExtractRegressionDetails:
         assert any("decreased" in m for m in result[0]["metrics"])
 
     def test_first_entry_changepoint(self):
+        """Verify handling when the first entry is a changepoint."""
         data = [
             {
                 "uuid": "first",

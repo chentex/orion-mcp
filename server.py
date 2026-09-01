@@ -1,3 +1,4 @@
+"""Orion MCP server entry point using FastMCP with FileSystemProvider."""
 import os
 import sys
 from pathlib import Path

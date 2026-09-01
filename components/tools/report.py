@@ -1,3 +1,4 @@
+"""Tool for generating Orion performance analysis reports."""
 import json
 from typing import Annotated
 

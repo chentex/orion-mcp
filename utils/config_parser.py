@@ -1,3 +1,4 @@
+"""Helpers for parsing and rendering Orion YAML configuration files."""
 import os
 
 import jinja2

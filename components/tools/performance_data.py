@@ -1,3 +1,5 @@
+"""Tool for retrieving Orion performance data values."""
+# pylint: disable=duplicate-code
 from typing import Annotated
 
 from pydantic import Field

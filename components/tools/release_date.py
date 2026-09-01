@@ -1,3 +1,4 @@
+"""Tool for looking up OpenShift version release dates."""
 from typing import Annotated
 
 from pydantic import Field

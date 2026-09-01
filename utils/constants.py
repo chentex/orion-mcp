@@ -25,3 +25,11 @@ DEFAULT_ORION_CONFIGS = [
     "small-scale-udn-l3.yaml",
     "med-scale-udn-l3.yaml",
 ]
+
+DEFAULT_TRT_CONFIGS = [
+    "trt-external-payload-cluster-density.yaml",
+    "trt-external-payload-node-density.yaml",
+    "trt-external-payload-node-density-cni.yaml",
+    "trt-external-payload-crd-scale.yaml",
+    "trt-external-payload-udn-density-pods.yaml",
+]

@@ -1,3 +1,4 @@
+"""Tools for querying Orion metrics and metadata."""
 import os
 from typing import Annotated
 

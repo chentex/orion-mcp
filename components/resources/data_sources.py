@@ -1,3 +1,4 @@
+"""MCP resources for Orion data sources and release dates."""
 from fastmcp.resources import resource
 
 from utils.constants import RELEASE_DATES

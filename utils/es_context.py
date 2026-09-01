@@ -1,8 +1,10 @@
+"""Utility to extract and set ES server config from MCP request headers."""
 from utils.utils import current_es_config
 from utils.header_decryption import get_es_config_from_headers
 
 
 def extract_and_set_es_server(ctx) -> None:
+    """Extract ES config from request headers and store in context variable."""
     if not ctx:
         return
     try:

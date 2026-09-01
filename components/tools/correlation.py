@@ -1,3 +1,5 @@
+"""Tool for computing and visualising metric correlations."""
+# pylint: disable=duplicate-code
 from typing import Annotated
 
 from pydantic import Field

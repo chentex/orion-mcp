@@ -1,3 +1,5 @@
+"""Tool for analysing OpenShift pull request performance impact."""
+# pylint: disable=duplicate-code
 import json
 import os
 from typing import Annotated
@@ -6,7 +8,7 @@ from pydantic import Field
 from fastmcp import Context
 from fastmcp.tools import tool
 
-from utils.constants import ORION_CONFIGS_PATH
+from utils.constants import ORION_CONFIGS_PATH, DEFAULT_TRT_CONFIGS
 from utils.utils import run_orion, safe_json_loads
 from utils.es_context import extract_and_set_es_server
 
@@ -43,13 +45,7 @@ async def get_pr_details(
     lookback: str = "15",
 ) -> list[dict]:
     """Get PR performance analysis details by running Orion with input variables."""
-    configs = [
-        "trt-external-payload-cluster-density.yaml",
-        "trt-external-payload-node-density.yaml",
-        "trt-external-payload-node-density-cni.yaml",
-        "trt-external-payload-crd-scale.yaml",
-        "trt-external-payload-udn-density-pods.yaml",
-    ]
+    configs = list(DEFAULT_TRT_CONFIGS)
 
     if not pull_requests:
         raise ValueError("At least one pull request number is required")
