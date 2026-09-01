@@ -7,7 +7,7 @@ from fastmcp import Context
 from fastmcp.tools import tool
 
 from utils.constants import ORION_CONFIGS_PATH
-from utils.utils import run_orion
+from utils.utils import run_orion, safe_json_loads
 from utils.es_context import extract_and_set_es_server
 
 
@@ -80,8 +80,8 @@ async def get_pr_details(
         )
 
         try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError as e:
+            data = safe_json_loads(result.stdout)
+        except (json.JSONDecodeError, TypeError) as e:
             print(f"Failed to parse orion output for {full_config_path}: {e}")
             continue
 

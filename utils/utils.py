@@ -208,6 +208,34 @@ async def run_orion(
     return result
 
 
+def validate_config_name(config_name: str) -> str:
+    """Validate that a config name is a safe filename with no path traversal."""
+    basename = os.path.basename(config_name)
+    if basename != config_name or ".." in config_name or config_name.startswith("/"):
+        raise ValueError(f"Invalid config name: {config_name}")
+    return config_name
+
+
+def safe_json_loads(raw: str) -> list | dict:
+    """Parse JSON from Orion stdout, stripping non-JSON prefix/suffix."""
+    text = raw.strip()
+    start = text.find("[")
+    start_obj = text.find("{")
+    if start == -1 and start_obj == -1:
+        raise json.JSONDecodeError("No JSON found", text, 0)
+    if start == -1:
+        start = start_obj
+    elif start_obj != -1:
+        start = min(start, start_obj)
+
+    bracket = text[start]
+    close = "]" if bracket == "[" else "}"
+    end = text.rfind(close)
+    if end == -1:
+        raise json.JSONDecodeError("No closing bracket found", text, start)
+    return json.loads(text[start:end + 1])
+
+
 async def summarize_result(result: subprocess.CompletedProcess, isolate: Optional[str] = None) -> dict | str:
     """
     Summarize the Orion result into a dictionary.
@@ -224,7 +252,7 @@ async def summarize_result(result: subprocess.CompletedProcess, isolate: Optiona
         if result.returncode == 3:
             return {}
 
-        data = json.loads(result.stdout)
+        data = safe_json_loads(result.stdout)
         if len(data) == 0:
             return {}
 

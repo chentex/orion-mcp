@@ -6,7 +6,7 @@ from fastmcp import Context
 from fastmcp.tools import tool
 
 from utils.constants import ORION_CONFIGS_PATH
-from utils.utils import orion_metrics
+from utils.utils import orion_metrics, validate_config_name
 from utils.config_parser import _load_config_metrics_with_meta
 from utils.es_context import extract_and_set_es_server
 
@@ -24,7 +24,7 @@ async def get_orion_metrics(
     extract_and_set_es_server(ctx)
 
     default_config = "small-scale-udn-l3.yaml"
-    effective_config = config_name or default_config
+    effective_config = validate_config_name(config_name or default_config)
     result = await orion_metrics([ORION_CONFIGS_PATH + effective_config], version=version)
 
     if isinstance(result, str):
@@ -45,7 +45,7 @@ async def get_orion_metrics_with_meta(
     extract_and_set_es_server(ctx)
 
     default_config = "small-scale-udn-l3.yaml"
-    effective_config = config_name or default_config
+    effective_config = validate_config_name(config_name or default_config)
     try:
         metrics, meta_map = _load_config_metrics_with_meta(
             os.path.join(ORION_CONFIGS_PATH, effective_config),

@@ -6,7 +6,7 @@ from fastmcp.utilities.types import Image
 from fastmcp.tools import tool
 
 from utils.constants import ORION_CONFIGS_PATH
-from utils.utils import run_orion, summarize_result, generate_correlation_plot
+from utils.utils import run_orion, summarize_result, generate_correlation_plot, validate_config_name
 from utils.es_context import extract_and_set_es_server
 
 
@@ -33,7 +33,7 @@ async def metrics_correlation(
     extract_and_set_es_server(ctx)
 
     default_config = "trt-external-payload-cluster-density.yaml"
-    config_value = config_name or default_config
+    config_value = validate_config_name(config_name or default_config)
 
     result = await run_orion(
         config=ORION_CONFIGS_PATH + config_value,

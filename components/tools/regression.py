@@ -11,13 +11,15 @@ from utils.utils import (
     run_orion,
     parse_nightly_version,
     filter_data_by_timestamp,
+    safe_json_loads,
+    validate_config_name,
 )
 from utils.config_parser import _timestamp_after
 from utils.es_context import extract_and_set_es_server
 
 
 def _extract_regression_details(stdout: str) -> list[dict]:
-    data = json.loads(stdout)
+    data = safe_json_loads(stdout)
     details: list[dict] = []
     for idx, dat in enumerate(data):
         if not dat.get("is_changepoint"):
@@ -54,7 +56,7 @@ async def _run_regression_checks(
     version: str,
     lookback: str,
 ) -> str:
-    full_config_paths = [os.path.join(ORION_CONFIGS_PATH, config) for config in configs]
+    full_config_paths = [os.path.join(ORION_CONFIGS_PATH, validate_config_name(config)) for config in configs]
     changepoints: list[str] = []
 
     for full_config_path in full_config_paths:
@@ -67,7 +69,11 @@ async def _run_regression_checks(
         )
 
         if result.returncode not in (0, 3):
-            details = _extract_regression_details(result.stdout)
+            try:
+                details = _extract_regression_details(result.stdout)
+            except (json.JSONDecodeError, TypeError):
+                changepoints.append(f"Failed to parse Orion output for {full_config_path} (returncode={result.returncode})")
+                continue
             for det in details:
                 header_lines = [
                     f"Change detected in configuration: '{full_config_path}'",
@@ -181,7 +187,7 @@ async def has_nightly_regressed(
     all_regressions: list[str] = []
 
     for config in config_list:
-        full_config_path = os.path.join(ORION_CONFIGS_PATH, config)
+        full_config_path = os.path.join(ORION_CONFIGS_PATH, validate_config_name(config))
         result = await run_orion(
             config=full_config_path,
             version=nightly_info.major_version,
@@ -190,8 +196,11 @@ async def has_nightly_regressed(
             jira_status_filter="Done",
         )
 
+        if result.returncode not in (0, 1, 2):
+            continue
+
         try:
-            data = json.loads(result.stdout)
+            data = safe_json_loads(result.stdout)
             if not isinstance(data, list):
                 continue
             data = filter_data_by_timestamp(data, nightly_info.nightly_date)

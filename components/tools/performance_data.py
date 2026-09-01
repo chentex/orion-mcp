@@ -5,7 +5,7 @@ from fastmcp import Context
 from fastmcp.tools import tool
 
 from utils.constants import ORION_CONFIGS_PATH
-from utils.utils import run_orion, summarize_result
+from utils.utils import run_orion, summarize_result, validate_config_name
 from utils.es_context import extract_and_set_es_server
 
 
@@ -26,7 +26,7 @@ async def get_orion_performance_data(
     extract_and_set_es_server(ctx)
 
     default_config = "small-scale-udn-l3.yaml"
-    config_value = config_name or default_config
+    config_value = validate_config_name(config_name or default_config)
     try:
         result = await run_orion(
             config=ORION_CONFIGS_PATH + config_value,

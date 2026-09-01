@@ -7,7 +7,7 @@ from fastmcp.utilities.types import Image
 from fastmcp.tools import tool
 
 from utils.constants import ORION_CONFIGS_PATH
-from utils.utils import run_orion, summarize_result, generate_multi_line_plot
+from utils.utils import run_orion, summarize_result, generate_multi_line_plot, validate_config_name
 from utils.es_context import extract_and_set_es_server
 
 
@@ -47,7 +47,7 @@ async def openshift_report_on(
     full_data: dict[str, dict] = {}
 
     default_config = "small-scale-udn-l3.yaml"
-    config_value = config_name or default_config
+    config_value = validate_config_name(config_name or default_config)
     errors = []
     for ver in version_list:
         result = await run_orion(

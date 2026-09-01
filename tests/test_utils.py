@@ -6,6 +6,8 @@ from utils.utils import (
     parse_nightly_version,
     parse_timestamp,
     filter_data_by_timestamp,
+    validate_config_name,
+    safe_json_loads,
 )
 
 
@@ -86,3 +88,51 @@ class TestFilterDataByTimestamp:
         data = [{"no_timestamp": True}]
         result = filter_data_by_timestamp(data, datetime(2025, 1, 1))
         assert result == []
+
+
+class TestValidateConfigName:
+    def test_valid_name(self):
+        assert validate_config_name("small-scale-udn-l3.yaml") == "small-scale-udn-l3.yaml"
+
+    def test_rejects_path_traversal(self):
+        with pytest.raises(ValueError, match="Invalid config name"):
+            validate_config_name("../../../etc/passwd")
+
+    def test_rejects_absolute_path(self):
+        with pytest.raises(ValueError, match="Invalid config name"):
+            validate_config_name("/etc/passwd")
+
+    def test_rejects_subdirectory(self):
+        with pytest.raises(ValueError, match="Invalid config name"):
+            validate_config_name("subdir/config.yaml")
+
+    def test_rejects_dotdot_in_name(self):
+        with pytest.raises(ValueError, match="Invalid config name"):
+            validate_config_name("..config.yaml")
+
+
+class TestSafeJsonLoads:
+    def test_clean_json_array(self):
+        result = safe_json_loads('[{"key": "value"}]')
+        assert result == [{"key": "value"}]
+
+    def test_clean_json_object(self):
+        result = safe_json_loads('{"key": "value"}')
+        assert result == {"key": "value"}
+
+    def test_json_with_prefix(self):
+        result = safe_json_loads('INFO: some log\n[{"key": "value"}]')
+        assert result == [{"key": "value"}]
+
+    def test_json_with_suffix(self):
+        result = safe_json_loads('[{"key": "value"}]\nDone.')
+        assert result == [{"key": "value"}]
+
+    def test_json_with_prefix_and_suffix(self):
+        result = safe_json_loads('LOG [{"a": 1}] trailing')
+        assert result == [{"a": 1}]
+
+    def test_no_json_raises(self):
+        import json
+        with pytest.raises(json.JSONDecodeError):
+            safe_json_loads("no json here")
