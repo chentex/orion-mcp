@@ -24,7 +24,14 @@ import httpx
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.constants import ORION_CONFIGS_PATH
+from utils.constants import (
+    DEFAULT_ES_BENCHMARK_INDEX,
+    DEFAULT_ES_METADATA_INDEX,
+    DEFAULT_LOOKBACK_DAYS,
+    GITHUB_CONFIGS_URL,
+    GITHUB_HTTP_TIMEOUT,
+    ORION_CONFIGS_PATH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +108,7 @@ async def run_command_async(command: list[str] | str, env: Optional[dict] = None
         )
         return result
     except (OSError, subprocess.SubprocessError) as e:
+        logger.error("Command execution failed: %s", e)
         return subprocess.CompletedProcess(
             args=command,
             returncode=1,
@@ -236,6 +244,7 @@ async def summarize_result(result: subprocess.CompletedProcess, isolate: Optiona
                 else:
                     summary[metric_name]["value"].append(metric_data["value"])
     except Exception as e:
+        logger.error("Error summarizing Orion result: %s", e)
         return f"Error : {e}"
     return summary
 
@@ -285,7 +294,7 @@ def get_es_metadata_index() -> str:
 
     # Fall back to environment variable
     logger.info("Using es_metadata_index from environment/default")
-    return resolve_env_var("es_metadata_index", "ES_METADATA_INDEX", "perf_scale_ci*")
+    return resolve_env_var("es_metadata_index", "ES_METADATA_INDEX", DEFAULT_ES_METADATA_INDEX)
 
 
 def get_es_benchmark_index() -> str:
@@ -308,7 +317,7 @@ def get_es_benchmark_index() -> str:
 
     # Fall back to environment variable
     logger.info("Using es_benchmark_index from environment/default")
-    return resolve_env_var("es_benchmark_index", "ES_BENCHMARK_INDEX", "ripsaw-kube-burner-*")
+    return resolve_env_var("es_benchmark_index", "ES_BENCHMARK_INDEX", DEFAULT_ES_BENCHMARK_INDEX)
 
 
 async def orion_metrics(config_list: list, version: str = "4.20", input_vars: Optional[dict] = None) -> dict | str:
@@ -328,7 +337,7 @@ async def orion_metrics(config_list: list, version: str = "4.20", input_vars: Op
         result = await run_orion(
             config=config,
             version=version,
-            lookback="15",
+            lookback=DEFAULT_LOOKBACK_DAYS,
             input_vars=input_vars,
         )
         try:
@@ -339,6 +348,7 @@ async def orion_metrics(config_list: list, version: str = "4.20", input_vars: Op
                     key for key in sum_result.keys() if key not in {"runs", "timestamp"}
                 ]
             else:
+                logger.error("Error processing result for %s: %s", config, sum_result)
                 return f"Error processing result for {config}: {sum_result}"
         except (KeyError, ValueError, TypeError) as e:
             return f"Error processing result for {config}: {e}"
@@ -372,11 +382,6 @@ def compute_correlation(values1: list[float], values2: list[float]) -> float:
     return float(np.corrcoef(values1, values2)[0, 1])
 
 
-GITHUB_CONFIGS_URL = "https://api.github.com/repos/cloud-bulldozer/orion/contents/examples"
-
-logger = logging.getLogger(__name__)
-
-
 def list_orion_configs() -> list[str]:
     """
     List the Orion configuration files.
@@ -386,7 +391,7 @@ def list_orion_configs() -> list[str]:
     2. Local /orion/examples/ directory
     """
     try:
-        resp = httpx.get(GITHUB_CONFIGS_URL, timeout=10)
+        resp = httpx.get(GITHUB_CONFIGS_URL, timeout=GITHUB_HTTP_TIMEOUT)
         resp.raise_for_status()
         configs = [
             item["name"]
@@ -400,7 +405,8 @@ def list_orion_configs() -> list[str]:
 
     try:
         return [f for f in os.listdir(ORION_CONFIGS_PATH) if f.endswith(".yaml")]
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError) as e:
+        logger.warning("Failed to list local configs from %s: %s", ORION_CONFIGS_PATH, e)
         return []
 
 def generate_correlation_plot(

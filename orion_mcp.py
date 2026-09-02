@@ -23,7 +23,20 @@ from pydantic import Field
 # Import utility functions from utils module
 import httpx
 
-from utils.constants import ORION_CONFIGS_PATH, RELEASE_DATES
+from utils.constants import (
+    DEFAULT_CONFIG,
+    DEFAULT_LOOKBACK_DAYS,
+    DEFAULT_NETWORKING_CONFIGS,
+    ES_HTTP_TIMEOUT,
+    GCSWEB_BASE_URL,
+    MCP_SERVER_HOST,
+    MCP_SERVER_PORT,
+    ORION_CONFIGS_PATH,
+    PROW_CONCURRENCY_LIMIT,
+    PROW_HTTP_TIMEOUT,
+    PROW_VIEW_PREFIX,
+    RELEASE_DATES,
+)
 from utils.header_decryption import get_es_config_from_headers
 from utils.utils import (
     run_orion,
@@ -44,17 +57,16 @@ from utils.utils import (
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(name="orion-mcp",
-              host="0.0.0.0",
-              port=3030)
+              host=MCP_SERVER_HOST,
+              port=MCP_SERVER_PORT)
 
-ORION_CONFIGS_PATH = os.getenv("ORION_CONFIGS_PATH", "/orion/examples/")
 ORION_CONFIGS = list_orion_configs()
 
 # TLS verification — disable only for private CAs (set ORION_VERIFY_TLS=false)
 _VERIFY_TLS = os.getenv("ORION_VERIFY_TLS", "true").lower() != "false"
 
 # Semaphore to cap concurrent prow/gcsweb requests per discover_jobs call
-_PROW_SEMAPHORE = asyncio.Semaphore(15)
+_PROW_SEMAPHORE = asyncio.Semaphore(PROW_CONCURRENCY_LIMIT)
 
 
 # Common parameter types — define once, reuse across all tools
@@ -82,9 +94,6 @@ def _parse_input_vars(input_vars: str) -> dict | None:
         return json.loads(input_vars)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError(f"Malformed input_vars JSON: {exc}") from exc
-
-
-DEFAULT_CONFIG = "cluster-density.yaml"
 
 
 def _split_configs(config_name: str | None, default: list[str] | None = None) -> list[str]:
@@ -144,9 +153,8 @@ def _extract_and_set_es_server(ctx) -> None:
                 es_config = get_es_config_from_headers(headers_dict)
                 if es_config:
                     current_es_config.set(es_config)
-    except Exception:
-        # Silently fall back to environment variables
-        pass
+    except Exception as exc:
+        logger.debug("Failed to extract ES config from headers, falling back to env vars: %s", exc)
 
 
 @mcp.resource("orion-mcp://release_dates")
@@ -198,10 +206,6 @@ def get_orion_configs() -> list[str]:
     return orion_configs(ORION_CONFIGS)
 
 
-_GCSWEB_BASE = "https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs"
-_PROW_VIEW_PREFIX = "https://prow.ci.openshift.org/view/gs/"
-
-
 async def _resolve_configs_from_prow(build_url: str) -> list[str]:
     """Resolve Orion config filenames from prow build-log artifacts.
 
@@ -210,15 +214,15 @@ async def _resolve_configs_from_prow(build_url: str) -> list[str]:
     Works for any workload automatically as long as the prow step logs ORION_CONFIG.
     Returns empty list if build URL is missing, expired, or contains no orion steps.
     """
-    if not build_url or _PROW_VIEW_PREFIX not in build_url:
+    if not build_url or PROW_VIEW_PREFIX not in build_url:
         return []
 
-    gcs_path = build_url.replace(_PROW_VIEW_PREFIX, "")
-    gcs_base = f"{_GCSWEB_BASE}/{gcs_path}"
+    gcs_path = build_url.replace(PROW_VIEW_PREFIX, "")
+    gcs_base = f"{GCSWEB_BASE_URL}/{gcs_path}"
 
     configs = set()
     try:
-        async with httpx.AsyncClient(timeout=15, verify=_VERIFY_TLS, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=PROW_HTTP_TIMEOUT, verify=_VERIFY_TLS, follow_redirects=True) as client:
             resp = await client.get(f"{gcs_base}/artifacts/")
             if resp.status_code != 200:
                 return []
@@ -253,7 +257,7 @@ async def _resolve_configs_from_prow(build_url: str) -> list[str]:
             results = await asyncio.gather(*[_fetch_config(d) for d in orion_dirs])
             configs = {r for r in results if r}
     except Exception as exc:
-        print(f"Failed to resolve configs from prow: {exc}")
+        logger.error("Failed to resolve configs from prow: %s", exc)
 
     return sorted(configs)
 
@@ -343,7 +347,7 @@ async def discover_jobs(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=30, verify=_VERIFY_TLS) as client:
+        async with httpx.AsyncClient(timeout=ES_HTTP_TIMEOUT, verify=_VERIFY_TLS) as client:
             resp = await client.post(
                 f"{es_server}/{es_index}/_search",
                 json=query,
@@ -352,6 +356,7 @@ async def discover_jobs(
             resp.raise_for_status()
             data = resp.json()
     except Exception as exc:
+        logger.error("ES query failed for discover_jobs: %s", exc)
         return {"error": f"ES query failed: {exc}"}
 
     jobs = {}
@@ -467,7 +472,7 @@ async def get_orion_metrics_with_meta(
 @mcp.tool()
 async def openshift_report_on(
     versions: Annotated[str, Field(description="Comma-separated list of OpenShift versions e.g. '4.19,4.20'")] = "4.19",
-    lookback: LookbackParam = "15",
+    lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     since: Annotated[str, Field(description="Date to begin lookback")] = None,
     *,
     metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
@@ -537,7 +542,8 @@ async def openshift_report_on(
             sum_result = await summarize_result(result, isolate=metric)
 
             if not isinstance(sum_result, dict) or metric not in sum_result:
-                errors.append(f"[{cfg}] No data for version {ver}: {sum_result}")
+                logger.warning("No data for metric %s, version %s, config %s", metric, ver, cfg)
+                errors.append(f"[{cfg}] No data for version {ver}, metric {metric}")
                 continue
 
             raw_values = sum_result[metric].get("value", [])
@@ -623,7 +629,7 @@ async def get_orion_performance_data(
     *,
     metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
     version: VersionParam = "4.19",
-    lookback: LookbackParam = "15",
+    lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     since: Annotated[str | None, Field(description="Date to begin looking back for performance data")] = None,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
@@ -665,11 +671,13 @@ async def get_orion_performance_data(
             sum_result = await summarize_result(result, isolate=metric)
 
             if not isinstance(sum_result, dict) or metric not in sum_result:
+                logger.warning("No data for version %s in config %s: %s", version, cfg, sum_result)
                 results.append({"config": cfg, "error": f"No data found for metric {metric}"})
                 continue
 
             values = sum_result[metric].get("value", [])
             if not isinstance(values, list):
+                logger.warning("Unexpected data format for metric %s in config %s", metric, cfg)
                 results.append({"config": cfg, "error": f"Unexpected data format for metric {metric}"})
                 continue
 
@@ -693,7 +701,7 @@ async def get_pr_details(
     repository: str,
     pull_requests: list[str],
     version: str = "4.20",
-    lookback: str = "15",
+    lookback: str = DEFAULT_LOOKBACK_DAYS,
     *,
     configs: list[str] | None = None,
     input_vars: dict | None = None,
@@ -748,7 +756,7 @@ async def get_pr_details(
             continue
 
         pulls_list = data["pulls"]
-        _add_percentage_changes(pulls_list, data["periodic_avg"])
+        _add_percentage_changes(pulls_list, periodic_avg)
 
         summaries.append({
             "config": full_config_path,
@@ -763,7 +771,7 @@ async def get_pr_details(
 async def openshift_report_on_pr(
     version: Annotated[str, Field(description="OpenShift version to analyze")] = "4.20",
     *,
-    lookback: Annotated[str, Field(description="Number of days to lookback")] = "15",
+    lookback: Annotated[str, Field(description="Number of days to lookback")] = DEFAULT_LOOKBACK_DAYS,
     organization: Annotated[str, Field(description="Organization to look into")] = "openshift",
     repository: Annotated[str, Field(description="Repository to look into")] = "ovn-kubernetes",
     pull_request: Annotated[str, Field(description="PR number to analyze (for single PR)")] = "2841",
@@ -883,7 +891,8 @@ async def _run_regression_checks(
 
         try:
             details = _extract_regression_details(result.stdout)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.error("Failed to parse Orion output for %s (exit %d): %s", config_short, result.returncode, exc)
             stderr_snippet = _orion_error_snippet(result)
             changepoints.append(f"❌ Error: Orion failed for {config_short} (exit {result.returncode}): {stderr_snippet}")
             continue
@@ -937,7 +946,7 @@ async def _check_regression(
 @mcp.tool()
 async def has_openshift_regressed(
     version: VersionParam = "4.19",
-    lookback: LookbackParam = "15",
+    lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     config_name: ConfigParam = None,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
@@ -962,18 +971,10 @@ async def has_openshift_regressed(
     return await _check_regression(ctx, config_name, input_vars, version, lookback)
 
 
-# Networking configs are run inside payload jobs (no separate networking job).
-# These two cover CNI and UDN workloads and survive after orion/pull/423 cleanup.
-_DEFAULT_NETWORKING_CONFIGS = [
-    "node-density-cni.yaml",
-    "udn-density-pods.yaml",
-]
-
-
 @mcp.tool()
 async def has_networking_regressed(
     version: VersionParam = "4.19",
-    lookback: LookbackParam = "15",
+    lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     config_name: ConfigParam = None,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
@@ -995,7 +996,7 @@ async def has_networking_regressed(
         Changepoint details or "No changepoints found".
     """
     return await _check_regression(ctx, config_name, input_vars, version, lookback,
-                                   default_configs=_DEFAULT_NETWORKING_CONFIGS)
+                                   default_configs=DEFAULT_NETWORKING_CONFIGS)
 
 # Correlation tool
 
@@ -1007,7 +1008,7 @@ async def metrics_correlation(
     config_name: ConfigParam = None,
     since: Annotated[str, Field(description="Date to begin looking back for performance data")] = None,
     version: VersionParam = "4.19",
-    lookback: LookbackParam = "15",
+    lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
 ) -> types.ImageContent | types.TextContent:
@@ -1044,6 +1045,7 @@ async def metrics_correlation(
 
     # Ensure we received a valid dict back
     if not isinstance(summary, dict):
+        logger.warning("Error processing Orion output: %s", summary)
         return types.TextContent(type="text", text=f"Error processing Orion output: {summary}")
 
     # Extract metric values
@@ -1066,7 +1068,7 @@ async def metrics_correlation(
 async def has_nightly_regressed(
     nightly_version: Annotated[str, Field(description="Full nightly version string (e.g., '4.22.0-0.nightly-2026-01-05-203335')")],
     previous_nightly: Annotated[str, Field(description="Optional previous nightly to compare against (e.g., '4.22.0-0.nightly-2026-01-01-123456')")] = "",
-    lookback: LookbackParam = "15",
+    lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     config_name: ConfigParam = None,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
@@ -1092,6 +1094,7 @@ async def has_nightly_regressed(
     try:
         nightly_info = parse_nightly_version(nightly_version)
     except ValueError as e:
+        logger.error("Error parsing nightly version '%s': %s", nightly_version, e)
         return f"Error parsing nightly version: {e}"
 
     if not nightly_info.is_nightly:
@@ -1129,12 +1132,14 @@ async def has_nightly_regressed(
 
         try:
             data = json.loads(result.stdout)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.error("Failed to parse Orion output for nightly %s, config %s: %s", nightly_version, config_value, exc)
             stderr_snippet = _orion_error_snippet(result)
             all_regressions.append(f"❌ Error: Orion failed for {config_value} (exit {result.returncode}): {stderr_snippet}")
             continue
 
         if not isinstance(data, list):
+            logger.error("Unexpected data type from Orion for nightly %s, config %s: %s", nightly_version, config_value, type(data).__name__)
             all_regressions.append(f"❌ Error: Orion returned unexpected data type for {config_value}: {type(data).__name__}")
             continue
 
@@ -1183,12 +1188,14 @@ async def _summarize_single_config(
     try:
         metrics_list, meta_map = _load_config_metrics_with_meta(full_path, version, input_vars=iv)
     except Exception as e:
+        logger.error("Failed to load config metrics for %s: %s", config_value, e)
         return {"config": config_value, "success": False, "error": f"Failed to load config metrics: {e}"}
 
     try:
         result = await run_orion(config=full_path, version=version, lookback=str(lookback), input_vars=iv)
         sum_result = await summarize_result(result)
     except Exception as e:
+        logger.error("Orion execution failed for %s: %s", config_value, e)
         return {"config": config_value, "success": False, "error": f"Orion failed: {e}"}
 
     if not isinstance(sum_result, dict):
@@ -1210,7 +1217,7 @@ async def _summarize_single_config(
                     if v is not None:
                         prior_sum.setdefault(m_name, []).append(v)
     except Exception as exc:
-        print(f"Prior-period query failed for {config_value}: {exc}")
+        logger.warning("Prior-period query failed for %s: %s", config_value, exc)
 
     metric_summaries = []
     for m_name in metrics_list:
@@ -1247,7 +1254,7 @@ async def _summarize_single_config(
 @mcp.tool()
 async def get_performance_summary(
     version: VersionParam = "4.19",
-    lookback: Annotated[int, Field(description="Number of days to look back for data")] = 14,
+    lookback: Annotated[int, Field(description="Number of days to look back for data")] = int(DEFAULT_LOOKBACK_DAYS),
     config_name: ConfigParam = None,
     input_vars: InputVarsParam = "",
     ctx: Context = None,
