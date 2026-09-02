@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -208,7 +209,8 @@ async def run_orion(
     }
 
     logger.debug("Env: version=%s, es_metadata_index=%s, es_benchmark_index=%s", version, es_metadata_index, es_benchmark_index)
-    result = await run_command_async(command, env=env, cwd="/tmp")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = await run_command_async(command, env=env, cwd=tmpdir)
     logger.debug("Orion return code: %d", result.returncode)
     logger.debug("Orion stdout: %s", result.stdout)
     logger.debug("Orion stderr: %s", result.stderr)
