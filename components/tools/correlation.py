@@ -28,7 +28,7 @@ async def metrics_correlation(
     metric2: Annotated[str, Field(description="Second metric to analyze")] = "ovnCPU_avg",
     *,
     config_name: ConfigParam = None,
-    since: Annotated[str, Field(description="Date to begin looking back for performance data")] = None,
+    since: Annotated[str | None, Field(description="Date to begin looking back for performance data")] = None,
     version: VersionParam = "4.19",
     lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
     input_vars: InputVarsParam = "",
@@ -68,14 +68,25 @@ async def metrics_correlation(
         return types.TextContent(type="text", text=f"Error processing Orion output: {summary}")
 
     try:
-        values1 = summary[metric1]["value"]
-        values2 = summary[metric2]["value"]
+        raw1 = summary[metric1]["value"]
+        raw2 = summary[metric2]["value"]
     except KeyError:
         return types.TextContent(
             type="text",
             text="Requested metrics not present in the Orion summary for the chosen configuration.",
         )
 
-    corr_b64 = generate_correlation_plot(values1, values2, metric1, metric2, title_prefix=f"{config_value}: ")
+    paired = [
+        (v1, v2) for v1, v2 in zip(raw1, raw2)
+        if isinstance(v1, (int, float)) and isinstance(v2, (int, float))
+    ]
+    if len(paired) < 2:
+        return types.TextContent(
+            type="text",
+            text=f"Not enough valid data points to compute correlation (got {len(paired)}, need at least 2).",
+        )
+    values1, values2 = zip(*paired)
 
-    return types.ImageContent(type="image", data=corr_b64.decode("utf-8"), mimeType="image/png")
+    corr_b64 = generate_correlation_plot(list(values1), list(values2), metric1, metric2, title_prefix=f"{config_value}: ")
+
+    return types.ImageContent(type="image", data=corr_b64.decode("utf-8"), mime_type="image/png")

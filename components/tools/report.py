@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 async def openshift_report_on(
     versions: Annotated[str, Field(description="Comma-separated list of OpenShift versions e.g. '4.19,4.20'")] = "4.19",
     lookback: LookbackParam = DEFAULT_LOOKBACK_DAYS,
-    since: Annotated[str, Field(description="Date to begin lookback")] = None,
+    since: Annotated[str | None, Field(description="Date to begin lookback")] = None,
     *,
     metric: Annotated[str, Field(description="Metric to analyze")] = "podReadyLatency_P99",
     config_name: ConfigParam = None,
@@ -149,7 +149,7 @@ async def openshift_report_on(
 
     try:
         img_b64 = generate_multi_line_plot(all_series, metric)
-        return types.ImageContent(type="image", data=img_b64.decode("utf-8"), mimeType="image/png")
+        return types.ImageContent(type="image", data=img_b64.decode("utf-8"), mime_type="image/png")
     except ValueError as e:
         return types.TextContent(type="text", text=str(e))
 
@@ -255,8 +255,12 @@ async def get_performance_summary(
         config_value, iv = await resolve_config_and_vars(ctx, None, version, input_vars)
         configs = [config_value]
 
-    results = await asyncio.gather(*[
-        _summarize_single_config(c, version, lookback, iv) for c in configs
-    ])
+    sem = asyncio.Semaphore(5)
+
+    async def _bounded(c):
+        async with sem:
+            return await _summarize_single_config(c, version, lookback, iv)
+
+    results = await asyncio.gather(*[_bounded(c) for c in configs])
 
     return {"success": any(r.get("success") for r in results), "results": list(results)}

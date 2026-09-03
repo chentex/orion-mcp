@@ -79,4 +79,5 @@ async def get_orion_metrics_with_meta(
         )
         if isinstance(result, str):
             return {"error": f"{e} | {result}"}
-        return {"metrics": result, "meta": {}, "warning": str(e)}
+        metrics = result.get(config_path(effective_config), []) if isinstance(result, dict) else result
+        return {"metrics": metrics, "meta": {}, "warning": str(e)}

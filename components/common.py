@@ -42,7 +42,11 @@ def split_configs(config_name: str | None, default: list[str] | None = None) -> 
 
 def config_path(config_name: str) -> str:
     """Return the full filesystem path for an Orion config filename."""
-    return os.path.join(ORION_CONFIGS_PATH, config_name)
+    resolved = os.path.realpath(os.path.join(ORION_CONFIGS_PATH, config_name))
+    configs_root = os.path.realpath(ORION_CONFIGS_PATH)
+    if not resolved.startswith(configs_root + os.sep) and resolved != configs_root:
+        raise ValueError(f"Config path escapes allowed directory: {config_name}")
+    return resolved
 
 
 def orion_error_snippet(result) -> str:
@@ -54,7 +58,10 @@ async def resolve_config_and_vars(ctx, config_name, _version, input_vars=""):
     """Common setup: extract ES config, parse config name and input_vars."""
     extract_and_set_es_server(ctx)
     config_value = config_name or DEFAULT_CONFIG
-    iv = parse_input_vars(input_vars) if input_vars else None
+    try:
+        iv = parse_input_vars(input_vars) if input_vars else None
+    except ValueError as exc:
+        raise ValueError(f"Failed to resolve config/vars: {exc}") from exc
     return config_value, iv
 
 

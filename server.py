@@ -1,10 +1,8 @@
 """Orion MCP Server entry point."""
 
 import argparse
-import asyncio
 import logging
 import os
-import sys
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -35,10 +33,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=log_level, format="%(levelname)s:     %(message)s", force=True)
 
     if os.getenv("ES_SERVER") is None:
-        logger.error("ES_SERVER environment variable is not set")
-        sys.exit(1)
+        logger.warning("ES_SERVER environment variable is not set; requests must provide it via headers")
     TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
     HOST = os.getenv("MCP_HOST", "0.0.0.0")
     PORT = int(os.getenv("MCP_PORT", "3030"))
     logger.info("Running MCP server with transport: %s", TRANSPORT)
-    asyncio.run(mcp.run(transport=TRANSPORT, host=HOST, port=PORT))
+    mcp.run(transport=TRANSPORT, host=HOST, port=PORT)

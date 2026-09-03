@@ -155,11 +155,7 @@ class TestFilterDataByTimestamp:
             {"timestamp": 1768089600, "value": "way_after"},# 2026-01-11
         ]
         result = filter_data_by_timestamp(data, cutoff)
-        # Only entries on or before cutoff
-        assert len(result) <= len(data)
-        for entry in result:
-            dt = parse_timestamp(entry["timestamp"])
-            assert dt <= cutoff
+        assert result == data[:3]
 
     def test_empty_data(self):
         cutoff = datetime(2026, 1, 10, tzinfo=timezone.utc)

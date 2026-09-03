@@ -44,8 +44,8 @@ def _extract_regression_details(stdout: str) -> list[dict]:
 
         metrics: list[str] = []
         for metric_name, metric_info in dat.get("metrics", {}).items():
-            pct = metric_info.get("percentage_change", 0)
-            if pct == 0:
+            pct = metric_info.get("percentage_change")
+            if not isinstance(pct, (int, float)) or isinstance(pct, bool) or pct == 0:
                 continue
             direction = "increased" if pct > 0 else "decreased"
             metrics.append(f"{metric_name} {direction} by {abs(pct):.2f}%")
