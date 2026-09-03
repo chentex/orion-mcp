@@ -62,10 +62,10 @@ RUN ln -sf /app/orion-venv/bin/orion /usr/local/bin/orion
 COPY . /app/orion-mcp/
 
 # Create wrapper script
-RUN printf '%s\n' '#!/bin/sh' '/app/orion-mcp-venv/bin/python /app/orion-mcp/orion_mcp.py "$@"' \
+RUN printf '%s\n' '#!/bin/sh' '/app/orion-mcp-venv/bin/python /app/orion-mcp/server.py "$@"' \
     > /usr/local/bin/orion-mcp && \
     chmod +x /usr/local/bin/orion-mcp
 
 WORKDIR /app/orion-mcp
 
-CMD ["/app/orion-mcp-venv/bin/python", "orion_mcp.py"]
+CMD ["/app/orion-mcp-venv/bin/python", "server.py"]
